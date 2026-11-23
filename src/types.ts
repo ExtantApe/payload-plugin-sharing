@@ -1,0 +1,138 @@
+import type { Payload, PayloadRequest, Where } from 'payload'
+
+export const GROUPS = 'share-groups'
+export const MEMBERS = 'share-members'
+
+export type Role = 'owner' | 'manager' | 'viewer'
+export type MemberStatus = 'invited' | 'active' | 'removed'
+
+/** Who a membership belongs to: a document in one of the host's member collections (users, organizations). */
+export type MemberRef = { relationTo: string; value: string | number }
+
+export type LevelConfig = { value?: string; label?: string }
+
+/** What the plugin settled on, kept in `config.custom.sharing` so the helpers need no global state. */
+export type ResolvedSharing = {
+  users: string
+  memberTypes: string[]
+  levels: Record<Role, { value: string; label: string }>
+  kinds: { value: string; label?: string }[]
+  identities?: SharingOptions['identities']
+}
+
+export type ShareGroup = {
+  id?: string | number
+  name: string
+  kind: string
+  owner: MemberRef
+}
+
+export type ShareMember = {
+  id?: string | number
+  group: string | number
+  member: MemberRef
+  /** The stored level value (by default `owner`, `manager` or `viewer`). */
+  level: string
+  status: MemberStatus
+  invitedBy?: string | number | null
+  acceptedAt?: string | null
+  removedAt?: string | null
+  removedBy?: string | number | null
+  notes?: string | null
+}
+
+type User = { id: string | number; collection?: string } & Record<string, unknown>
+
+export type GroupArgs = {
+  req: PayloadRequest
+  user: User
+  /** The group being created. */
+  data: Partial<ShareGroup>
+}
+
+export type MemberArgs = {
+  req: PayloadRequest
+  user: User
+  group: ShareGroup & { id: string | number }
+  /** The membership being created, or (for a change) the membership as it is now. */
+  member: Partial<ShareMember>
+  /** The role the asker holds in this group (through themselves or an identity), or null if none. */
+  actorRole: Role | null
+  /** For `canChangeLevel`: the level it would become. */
+  to?: string
+}
+
+export type RefuseArgs = {
+  req: PayloadRequest
+  group: ShareGroup & { id: string | number }
+  /** The member's own document (the user or organization). */
+  subject: Record<string, unknown> & { id: string | number }
+  ref: MemberRef
+  level: string
+  action: 'invite' | 'accept' | 'change-level'
+}
+
+export type AuditEvent = {
+  event: 'invite' | 'accept' | 'change-level' | 'remove'
+  phase: 'before' | 'after'
+  membership: ShareMember
+  /** The membership as it was. Absent for an invitation. */
+  previous?: ShareMember
+  /** The signed-in user's id, or null for server code. */
+  by: string | number | null
+  req: PayloadRequest
+}
+export type AuditHook = (event: AuditEvent) => void | Promise<void>
+
+type Check<A> = (args: A) => boolean | Promise<boolean>
+
+export type SharingOptions = {
+  /** Turn the plugin off without removing it. Default true. */
+  enabled?: boolean
+  /** The users collection. Default `users`. */
+  users?: string
+  /** Collections a member can come from. Default `[users]`. Add an organizations collection here. */
+  memberTypes?: string[]
+  /** The kinds of group the host offers, such as hobby, family or brand. With none, no group can be made. */
+  kinds: { value: string; label?: string }[]
+  /** Rename or relabel the three levels. The stored values default to `owner`, `manager` and `viewer`. */
+  levels?: Partial<Record<Role, LevelConfig>>
+  /**
+   * Other identities the signed-in user acts as, such as the organizations they work for. A membership held by any of
+   * them counts for the user. A throw means access is refused. Default: only the user.
+   */
+  identities?: (args: { req: PayloadRequest; user: User }) => MemberRef[] | Promise<MemberRef[]>
+  /** Who may make a group. Only an exact `true` counts. The group's owner must also be the asker or one of their identities. */
+  canCreateGroup?: Check<GroupArgs>
+  /** Who may invite someone to a group. Only an exact `true` counts; a throw, a truthy value or no hook is a no. */
+  canInvite?: Check<MemberArgs>
+  /** Who may change a member's level. Same rule: only an exact `true`. */
+  canChangeLevel?: Check<MemberArgs>
+  /** Who may remove someone else. Default: whoever `canChangeLevel` allows. Anyone may always leave or decline for themselves. */
+  canRemove?: Check<MemberArgs>
+  /** Who may accept an invitation for an organization. A user always accepts their own. Default: nobody. */
+  canAccept?: Check<MemberArgs>
+  /** Who may read memberships. Default: your own, and every membership in groups you are active in. May return a `where`. */
+  canRead?: (args: { req: PayloadRequest; user: User }) => boolean | Where | Promise<boolean | Where>
+  /**
+   * A veto the host controls, asked on every invitation, acceptance and level change, even for server code that skips
+   * access. Return `null` or nothing to go ahead, or a reason to refuse. A throw, `false` or anything else refuses with
+   * a general reason.
+   */
+  refuseMember?: (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
+  /** Audit hooks. A `before` hook that throws stops the change. An `after` hook that throws is logged and ignored. */
+  audit?: {
+    beforeInvite?: AuditHook
+    afterInvite?: AuditHook
+    beforeAccept?: AuditHook
+    afterAccept?: AuditHook
+    beforeChangeLevel?: AuditHook
+    afterChangeLevel?: AuditHook
+    beforeRemove?: AuditHook
+    afterRemove?: AuditHook
+  }
+  /** The admin group the collections sit in. Default `Sharing`. */
+  adminGroup?: string
+}
+
+export type PayloadLike = Payload | { payload: Payload }
