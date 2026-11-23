@@ -19,6 +19,9 @@ export type ResolvedSharing = {
   levels: Record<Role, { value: string; label: string }>
   kinds: { value: string; label?: string }[]
   identities?: SharingOptions['identities']
+  peopleOf?: SharingOptions['peopleOf']
+  /** False only when the host passed `allowWithoutTransactions`. */
+  needsTransactions: boolean
 }
 
 export type ShareGroup = {
@@ -113,7 +116,7 @@ export type SharingOptions = {
   levels?: Partial<Record<Role, LevelConfig>>
   /**
    * Other identities the signed-in user acts as, such as the organizations they work for. A membership held by any of
-   * them counts for the user. A throw means access is refused. Default: only the user.
+   * them counts for the user. An organization counts only if `peopleOf` lists the user for it; if `peopleOf` throws, it is dropped. A throw means access is refused. Default: only the user.
    */
   identities?: (args: { req: PayloadRequest; user: User }) => MemberRef[] | Promise<MemberRef[]>
   /**

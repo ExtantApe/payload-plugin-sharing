@@ -34,6 +34,30 @@ export const signedIn = (req: PayloadRequest, s: ResolvedSharing) => {
   return user && user.collection === s.users && idOf(user) !== null ? user : null
 }
 
+/** Whether `peopleOf` lists the user for the organization. Asked once per organization per request. A throw is a no. */
+async function listsUser(req: PayloadRequest, s: ResolvedSharing, org: MemberRef, userId: string | number): Promise<boolean> {
+  const context = (req.context ??= {}) as Record<string, unknown>
+  const cache = (context.sharingPeople ??= new Map<string, Promise<MemberRef[] | null>>()) as Map<string, Promise<MemberRef[] | null>>
+  const key = JSON.stringify([org.relationTo, String(org.value)])
+  if (!cache.has(key)) {
+    cache.set(
+      key,
+      (async () => {
+        try {
+          const ask = s.peopleOf
+          if (typeof ask !== 'function') return null
+          const people = await ask({ req, organization: org })
+          return Array.isArray(people) ? people.map((p) => refOf(p)).filter((p): p is MemberRef => !!p) : null
+        } catch {
+          return null
+        }
+      })(),
+    )
+  }
+  const people = await cache.get(key)!
+  return !!people && people.some((p) => p.relationTo === s.users && String(p.value) === String(userId))
+}
+
 /** The user plus whatever the host's `identities` hook adds. Throws if the hook throws; callers fail closed. */
 export async function identitiesOf(req: PayloadRequest, s = settings(req)): Promise<MemberRef[]> {
   const user = signedIn(req, s)
@@ -42,7 +66,10 @@ export async function identitiesOf(req: PayloadRequest, s = settings(req)): Prom
   if (s.identities) {
     for (const raw of await s.identities({ req, user })) {
       const ref = refOf(raw)
-      if (ref && s.memberTypes.includes(ref.relationTo) && !refs.some((r) => sameRef(r, ref))) refs.push(ref)
+      if (!ref || !s.memberTypes.includes(ref.relationTo) || refs.some((r) => sameRef(r, ref))) continue
+      // An organization counts only while the host's `peopleOf` lists this user for it. If that throws, the identity is dropped.
+      if (ref.relationTo !== s.users && typeof s.peopleOf === 'function' && !(await listsUser(req, s, ref, user.id))) continue
+      refs.push(ref)
     }
   }
   return refs

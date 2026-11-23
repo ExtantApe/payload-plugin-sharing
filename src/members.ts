@@ -135,11 +135,17 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
     }
   }
 
+  /** Server code can pass `disableTransaction`, which would split a change from its history row and skip the lock. */
+  const needTransaction = (req: PayloadRequest) => {
+    if (s.needsTransactions && !req.transactionID) throw refuse('This change needs a transaction, so it wasn’t made.')
+  }
+
   /**
    * Takes the group's lock and checks that an Owner is left once this one goes. Writing the group first means two
    * Owners leaving or demoting each other at once collide, and one of them is turned back.
    */
   async function keepAnOwner(req: PayloadRequest, group: GroupDoc, leaving: string | number) {
+    needTransaction(req)
     try {
       const fresh = (await req.payload.findByID({ collection: GROUPS as never, id: group.id, depth: 0, overrideAccess: true, req })) as unknown as { lock?: number }
       await req.payload.update({ collection: GROUPS as never, id: group.id, data: { lock: (fresh.lock ?? 0) + 1 } as never, overrideAccess: true, req })
@@ -282,6 +288,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
+          needTransaction(req)
           const now = new Date().toISOString()
           if (operation === 'create') {
             const group = await loadGroup(req, data.group)
@@ -300,7 +307,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             data.acceptedAt = founding ? now : null
             data.removedAt = null
             data.removedBy = null
-            if (asker !== null) data.invitedBy = asker
+            data.invitedBy = asker
             // The veto runs before the duplicate check, so a vetoed person gets the same answer whether or not they are already in.
             await vetoed(req, group, ref, data.level, 'invite')
             const dup = await req.payload.find({
@@ -328,8 +335,9 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             if (!same) throw refuse('Only the level, status and notes can be changed.')
           }
           for (const f of ['liveKey', 'acceptedAt', 'removedAt', 'removedBy']) delete data[f]
-          // Someone changing their own row (accepting or leaving) can't write the staff notes on it, unless they are staff in the group.
-          if ('notes' in data && isSelf(req, before.member)) {
+          // A signed-in person who isn't an Owner or Manager of the group can't write notes: not on their own row when they accept
+          // or leave, and not on an organization's row they act for. Server code can.
+          if ('notes' in data && signedIn(req, s)) {
             let staff = false
             try {
               const r = await roleIn(req, before.group)

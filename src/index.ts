@@ -83,6 +83,8 @@ export const sharing =
       levels,
       kinds: options.kinds ?? [],
       identities: options.identities,
+      peopleOf: options.peopleOf,
+      needsTransactions: options.allowWithoutTransactions !== true,
     }
     const before = config.onInit
     return {
