@@ -148,6 +148,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
         collection: MEMBERS as never,
         where: { and: [{ group: { equals: group.id } }, { status: { equals: 'active' } }, { level: { equals: s.levels.owner.value } }, { id: { not_equals: leaving } }] },
         limit: 1,
+        pagination: false, // only the rows are used; a count query beside it can break a transaction's first query
         depth: 0,
         overrideAccess: true,
         req,
@@ -320,6 +321,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
               collection: MEMBERS as never,
               where: { and: [{ group: { equals: group.id } }, { 'member.relationTo': { equals: ref.relationTo } }, { 'member.value': { equals: ref.value } }, { status: { in: LIVE } }] },
               limit: 1,
+              pagination: false, // only the rows are used; see keepAnOwner
               depth: 0,
               overrideAccess: true,
               req,

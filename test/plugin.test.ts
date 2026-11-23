@@ -1166,6 +1166,29 @@ describe('the third review', () => {
   })
 })
 
+describe('finds inside a transaction', () => {
+  it('never paginate, so no count query rides beside a find on the transaction’s session', async () => {
+    const original = payload.find.bind(payload)
+    const calls: { collection: unknown; pagination: unknown }[] = []
+    ;(payload as unknown as { find: unknown }).find = (args: { collection: unknown; pagination?: unknown; req?: unknown }) => {
+      if (args.req) calls.push({ collection: args.collection, pagination: args.pagination })
+      return original(args as never)
+    }
+    try {
+      const r = await join(ben, 'manager') // invite, accept
+      await invite(ann, { member: ref(dan), level: 'viewer' }) // the duplicate check
+      await change(ann, r.id, { level: 'viewer' })
+      await change(ann, (await rowOf(ann)).id, { level: 'owner' })
+      await join(cat, 'owner')
+      await change(ann, (await rowOf(ann)).id, { level: 'manager' }) // the last-Owner check
+    } finally {
+      ;(payload as unknown as { find: unknown }).find = original
+    }
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls.filter((c) => c.pagination !== false)).toEqual([])
+  })
+})
+
 describe('configuration', () => {
   it('stores the levels under the names the host gave them', () => {
     const cfg = sharing({ kinds: [{ value: 'hobby' }], refuseMember: false, levels: { owner: { value: 'steward', label: 'Steward' }, viewer: { label: 'Reader' } } })({ collections: [] } as never) as unknown as {
