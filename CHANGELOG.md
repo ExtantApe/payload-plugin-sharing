@@ -7,9 +7,11 @@
   - `share-groups` and `share-members` collections, with Owner, Manager and Viewer levels the host can rename, and member types the host can extend to organizations.
   - A group always keeps an active Owner. The last Owner can't leave or be demoted, and two Owners changing each other at once leave one.
   - Host hooks `canCreateGroup`, `canInvite`, `canChangeLevel`, `canRemove` and `canAccept`, all failing closed on anything but an exact `true`.
-  - A `refuseMember` veto on invite, accept and level change, applied to server code too.
+  - A required `refuseMember` veto (or an explicit `false`) on invite, accept and level change, applied to server code too. The reason is shown to the person refused, so the README warns against reasons that reveal an age.
+  - An append-only `share-member-events` history of every invite, accept, level change and removal, written in the same transaction.
+  - Deletes always throw, even with `overrideAccess`. Hooks receive plain ids and references, and the `id` and `data` of the change. Viewers see only Owners and Managers by default.
   - Audit hooks for invite, accept, change level and remove.
   - `shareGroupField`, `canView`, `canEdit` and `sharedWhere` for host collections.
   - Nothing is deleted; removal is a status, and a unique key stops a second live row for the same group and member.
-- Tested: 45 tests against real Payload 3.92 with an in-memory MongoDB replica set, covering each path above, repeated two-at-once runs for the last-Owner and duplicate-invite rules, and clean-up of the database and server at the end.
+- Tested: 61 tests against real Payload 3.92 with an in-memory MongoDB replica set, covering each path above, refusals over REST, GraphQL and bulk update, server-code attempts to revive or widen a membership, repeated two-at-once runs for the last-Owner and duplicate-invite rules, and clean-up of the database and server at the end.
 - Not tested: a database without transactions (the last-Owner guard needs a replica set), a live site, the admin screens in a browser, and a very large number of members.

@@ -3,6 +3,7 @@ import type { CollectionConfig, PayloadRequest, Where } from 'payload'
 import { exactlyTrue, refuse } from './groups.js'
 import { idOf, identitiesOf, refOf, roleIn, roleOf, sameRef, signedIn, whereRefs, groupIdsFor } from './helpers.js'
 import {
+  EVENTS,
   GROUPS,
   MEMBERS,
   type AuditEvent,
@@ -29,6 +30,16 @@ const normalize = (doc: Record<string, unknown>): ShareMember => ({
   removedBy: idOf(doc.removedBy),
 })
 
+/** Ids and member references as plain values, whatever shape the client or server code sent them in. */
+const plain = (data: Record<string, unknown> | undefined): Partial<ShareMember> => {
+  const d = { ...(data ?? {}) } as Record<string, unknown>
+  if ('group' in d) d.group = idOf(d.group)
+  if ('member' in d) d.member = refOf(d.member)
+  if ('invitedBy' in d) d.invitedBy = idOf(d.invitedBy)
+  if ('removedBy' in d) d.removedBy = idOf(d.removedBy)
+  return d as Partial<ShareMember>
+}
+
 export function membersCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {
   const levels = Object.values(s.levels)
   const by = (req: PayloadRequest) => idOf(req.user)
@@ -42,14 +53,19 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
   }
 
   /** The asker's hook, with the group and their own role in it. No signed-in user, no hook, or no exact true is a no. */
-  const ask = async (fn: ((a: MemberArgs) => boolean | Promise<boolean>) | undefined, req: PayloadRequest, member: Partial<ShareMember>, to?: string) => {
+  const ask = async (
+    fn: ((a: MemberArgs) => boolean | Promise<boolean>) | undefined,
+    req: PayloadRequest,
+    member: Partial<ShareMember>,
+    extra: { id?: string | number; data?: Partial<ShareMember>; to?: string } = {},
+  ) => {
     const user = signedIn(req, s)
     if (!user || !fn) return false
     try {
       const group = await loadGroup(req, member.group)
       if (!group) return false
       const actorRole = await roleIn(req, group.id).catch(() => null)
-      return await exactlyTrue(() => fn({ req, user, group, member, actorRole, to }))
+      return await exactlyTrue(() => fn({ req, user, group, id: extra.id, member, data: extra.data ?? member, actorRole, to: extra.to }))
     } catch {
       return false
     }
@@ -118,21 +134,25 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       description: 'Who is in which group, and at what level. Leave by setting the status to Removed; rows are never deleted, so the record stays.',
     },
     access: {
-      create: ({ req, data }) => ask(opts.canInvite, req, (data ?? {}) as Partial<ShareMember>),
+      create: ({ req, data }) => {
+        const d = plain(data as Record<string, unknown>)
+        return ask(opts.canInvite, req, d, { data: d })
+      },
       update: async ({ req, id, data }) => {
         try {
           if (id === undefined || id === null || !signedIn(req, s)) return false
           const doc = (await req.payload.findByID({ collection: MEMBERS as never, id, depth: 0, overrideAccess: true, req })) as unknown as Record<string, unknown>
           const before = normalize(doc)
-          const next = (data ?? {}) as Partial<ShareMember>
+          const next = plain(data as Record<string, unknown>)
+          const ctx = { id: before.id, data: next }
           const asks: Promise<boolean>[] = []
-          if (next.level !== undefined && next.level !== before.level) asks.push(ask(opts.canChangeLevel, req, before, String(next.level)))
+          if (next.level !== undefined && next.level !== before.level) asks.push(ask(opts.canChangeLevel, req, before, { ...ctx, to: String(next.level) }))
           if (next.status !== undefined && next.status !== before.status) {
-            if (next.status === 'active') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canAccept, req, before))
-            else if (next.status === 'removed') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canRemove ?? opts.canChangeLevel, req, before))
+            if (next.status === 'active') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canAccept, req, before, ctx))
+            else if (next.status === 'removed') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canRemove ?? opts.canChangeLevel, req, before, ctx))
             else return false
           }
-          if (!asks.length) return ask(opts.canChangeLevel, req, before, before.level)
+          if (!asks.length) return ask(opts.canChangeLevel, req, before, { ...ctx, to: before.level })
           return (await Promise.all(asks)).every(Boolean)
         } catch {
           return false
@@ -148,8 +168,16 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             return answer === true ? true : answer && typeof answer === 'object' ? answer : false
           }
           const refs = await identitiesOf(req, s)
-          const groups = await groupIdsFor(req, 'view')
-          return { or: [whereRefs(refs), ...(groups.length ? [{ group: { in: groups } }] : [])] } as Where
+          const staffed = await groupIdsFor(req, 'edit')
+          const viewed = await groupIdsFor(req, 'view')
+          // Owners and Managers see every row in their groups. A Viewer sees only the Owners and Managers, and their own row.
+          return {
+            or: [
+              whereRefs(refs),
+              ...(staffed.length ? [{ group: { in: staffed } }] : []),
+              ...(viewed.length ? [{ and: [{ group: { in: viewed } }, { level: { in: [s.levels.owner.value, s.levels.manager.value] } }, { status: { equals: 'active' } }] }] : []),
+            ],
+          } as unknown as Where
         } catch {
           return false
         }
@@ -194,6 +222,12 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
+      // Nothing is ever deleted, not even by server code that skips access.
+      beforeDelete: [
+        () => {
+          throw refuse('Memberships are never deleted. Set the status to Removed.')
+        },
+      ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
           const now = new Date().toISOString()
@@ -280,18 +314,43 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
         async ({ doc, previousDoc, operation, req }) => {
           const membership = normalize(doc)
           const asker = by(req)
+          // The history row is written in the same transaction, so a change without its record is rolled back.
+          const note = async (event: string, previous?: ShareMember) => {
+            const ref = membership.member
+            await req.payload.create({
+              collection: EVENTS as never,
+              data: {
+                group: membership.group,
+                membership: doc.id,
+                memberType: ref.relationTo,
+                memberId: String(ref.value),
+                event,
+                level: membership.level,
+                previousLevel: previous?.level ?? null,
+                status: membership.status,
+                previousStatus: previous?.status ?? null,
+                by: asker,
+              } as never,
+              overrideAccess: true,
+              req,
+            })
+          }
           if (operation === 'create') {
+            await note('invite')
             await run(opts.audit?.afterInvite, { event: 'invite', phase: 'after', membership, by: asker, req }, false)
             return doc
           }
           if (!previousDoc) return doc
           const previous = normalize(previousDoc)
           if (previous.status !== membership.status) {
+            await note(membership.status === 'removed' ? 'remove' : 'accept', previous)
             if (membership.status === 'removed') await run(opts.audit?.afterRemove, { event: 'remove', phase: 'after', membership, previous, by: asker, req }, false)
             else if (membership.status === 'active') await run(opts.audit?.afterAccept, { event: 'accept', phase: 'after', membership, previous, by: asker, req }, false)
           }
-          if (previous.level !== membership.level && membership.status !== 'removed')
+          if (previous.level !== membership.level && membership.status !== 'removed') {
+            if (previous.status === membership.status) await note('change-level', previous)
             await run(opts.audit?.afterChangeLevel, { event: 'change-level', phase: 'after', membership, previous, by: asker, req }, false)
+          }
           return doc
         },
       ],
@@ -300,3 +359,42 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
 }
 
 export type { Role }
+
+/** The append-only history: one row per invitation, acceptance, level change and removal. Never edited, never deleted. */
+export function eventsCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {
+  const stop = (what: string) => () => {
+    throw refuse(`The history can’t be ${what}.`)
+  }
+  return {
+    slug: EVENTS,
+    labels: { singular: 'Share member event', plural: 'Share member events' },
+    admin: { group: opts.adminGroup ?? 'Sharing', defaultColumns: ['group', 'event', 'memberType', 'memberId', 'createdAt'], description: 'What changed in each group’s membership, and who changed it. Append-only.' },
+    access: {
+      create: () => false,
+      update: () => false,
+      delete: () => false,
+      read: async ({ req }) => {
+        try {
+          if (!signedIn(req, s)) return false
+          const owned = await groupIdsFor(req, 'own')
+          return owned.length ? { group: { in: owned } } : false
+        } catch {
+          return false
+        }
+      },
+    },
+    fields: [
+      { name: 'group', type: 'relationship', relationTo: GROUPS, required: true, index: true },
+      { name: 'membership', type: 'relationship', relationTo: MEMBERS, required: true, index: true },
+      { name: 'memberType', type: 'text', required: true },
+      { name: 'memberId', type: 'text', required: true },
+      { name: 'event', type: 'select', required: true, options: ['invite', 'accept', 'change-level', 'remove'] },
+      { name: 'level', type: 'text' },
+      { name: 'previousLevel', type: 'text' },
+      { name: 'status', type: 'text' },
+      { name: 'previousStatus', type: 'text' },
+      { name: 'by', type: 'relationship', relationTo: s.users },
+    ],
+    hooks: { beforeDelete: [stop('deleted')], beforeChange: [({ operation, data }) => { if (operation !== 'create') throw refuse('The history can’t be edited.'); return data }] },
+  }
+}

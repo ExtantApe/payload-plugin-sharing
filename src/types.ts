@@ -2,6 +2,7 @@ import type { Payload, PayloadRequest, Where } from 'payload'
 
 export const GROUPS = 'share-groups'
 export const MEMBERS = 'share-members'
+export const EVENTS = 'share-member-events'
 
 export type Role = 'owner' | 'manager' | 'viewer'
 export type MemberStatus = 'invited' | 'active' | 'removed'
@@ -54,8 +55,12 @@ export type MemberArgs = {
   req: PayloadRequest
   user: User
   group: ShareGroup & { id: string | number }
-  /** The membership being created, or (for a change) the membership as it is now. */
+  /** The id of the membership being changed. Absent when one is being created. */
+  id?: string | number
+  /** The membership as it is now, or for an invitation what is being created. Ids are plain, never `{ id }` objects. */
   member: Partial<ShareMember>
+  /** The fields being sent: the whole invitation, or only what a change touches. Normalized the same way. */
+  data: Partial<ShareMember>
   /** The role the asker holds in this group (through themselves or an identity), or null if none. */
   actorRole: Role | null
   /** For `canChangeLevel`: the level it would become. */
@@ -71,6 +76,8 @@ export type RefuseArgs = {
   level: string
   action: 'invite' | 'accept' | 'change-level'
 }
+
+export type RefuseMember = (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
 
 export type AuditEvent = {
   event: 'invite' | 'accept' | 'change-level' | 'remove'
@@ -112,14 +119,18 @@ export type SharingOptions = {
   canRemove?: Check<MemberArgs>
   /** Who may accept an invitation for an organization. A user always accepts their own. Default: nobody. */
   canAccept?: Check<MemberArgs>
-  /** Who may read memberships. Default: your own, and every membership in groups you are active in. May return a `where`. */
+  /**
+   * Who may read memberships. Default: your own, every row in groups where you are an Owner or Manager, and only the
+   * Owners and Managers of groups where you are a Viewer. May return a `where` to widen or narrow that.
+   */
   canRead?: (args: { req: PayloadRequest; user: User }) => boolean | Where | Promise<boolean | Where>
   /**
    * A veto the host controls, asked on every invitation, acceptance and level change, even for server code that skips
    * access. Return `null` or nothing to go ahead, or a reason to refuse. A throw, `false` or anything else refuses with
-   * a general reason.
+   * a general reason. The reason is shown to whoever was refused, so never put a reason that reveals something private,
+   * such as an age. Required: pass `false` to say plainly that the host has no veto.
    */
-  refuseMember?: (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
+  refuseMember: RefuseMember | false
   /** Audit hooks. A `before` hook that throws stops the change. An `after` hook that throws is logged and ignored. */
   audit?: {
     beforeInvite?: AuditHook

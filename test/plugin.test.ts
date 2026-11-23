@@ -1,6 +1,8 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { buildConfig, getPayload, type Payload } from 'payload'
+import { configToSchema } from '@payloadcms/graphql'
+import { graphql } from 'graphql'
+import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { canEdit, canView, groupIdsFor, roleIn, sharedWhere, sharing, shareGroupField, type AuditEvent } from '../src/index.js'
@@ -13,6 +15,7 @@ const PW = 'correct-horse-battery'
 let payload: Payload
 let mongo: MongoMemoryReplSet
 const log: string[] = []
+const seen: { id?: unknown; data?: unknown; member?: unknown }[] = []
 const answers: { refuse?: () => unknown; beforeInvite?: () => void; canInvite?: () => unknown; identities?: () => unknown } = {}
 
 type U = { id: string | number }
@@ -51,6 +54,10 @@ const join = async (u: U, level: string) => {
   const r = await rowOf(u)
   await change(u, r.id, { status: 'active' })
   return r
+}
+/** The plugin's collections can't be deleted through Payload, so the test empties its own database directly. */
+const wipe = async () => {
+  for (const c of ['share-member-events', 'share-members', 'share-groups']) await (payload.db as unknown as { collections: Record<string, { deleteMany: (f: object) => Promise<unknown> }> }).collections[c]!.deleteMany({})
 }
 const record = (e: AuditEvent) => {
   log.push(`${e.phase}:${e.event}`)
@@ -98,12 +105,16 @@ beforeAll(async () => {
           return org ? [{ relationTo: 'organizations', value: ((org as { id?: unknown }).id ?? org) as string }] : []
         },
         canCreateGroup: ({ user }) => (user as { staff?: boolean }).staff === true,
-        canInvite: ({ actorRole, member, group: g }) => {
+        canInvite: ({ actorRole, member, group: g, data, id }) => {
+          seen.push({ id, data, member })
           if (answers.canInvite) return answers.canInvite() as boolean
           if (actorRole === 'owner') return true
           return actorRole === 'manager' && member.level === 'viewer' && g.kind !== 'family'
         },
-        canChangeLevel: ({ actorRole }) => actorRole === 'owner',
+        canChangeLevel: ({ actorRole, id, data, member }) => {
+          seen.push({ id, data, member })
+          return actorRole === 'owner'
+        },
         refuseMember: ({ subject, group: g }) => {
           if (answers.refuse) return answers.refuse() as string | null
           return (subject as { minor?: boolean }).minor && g.kind !== 'family' ? 'Not available for this account.' : null
@@ -135,7 +146,8 @@ afterAll(async () => {
 beforeEach(async () => {
   for (const key of Object.keys(answers)) delete (answers as Record<string, unknown>)[key]
   log.length = 0
-  for (const c of ['notes', 'share-members', 'share-groups', 'users', 'organizations'])
+  await wipe()
+  for (const c of ['notes', 'users', 'organizations'])
     await payload.delete({ collection: c as never, where: { id: { exists: true } }, overrideAccess: true })
   org = (await payload.create({ collection: 'organizations', data: { name: 'Made-up Co' } as never })) as unknown as U
   ann = await make('ann@example.com', { staff: true })
@@ -388,8 +400,7 @@ describe('a group always keeps an Owner', () => {
 
   it('keeps one Owner when two Owners demote each other at once', async () => {
     for (let i = 0; i < 4; i++) {
-      await payload.delete({ collection: 'share-members' as never, where: { id: { exists: true } }, overrideAccess: true })
-      await payload.delete({ collection: 'share-groups' as never, where: { id: { exists: true } }, overrideAccess: true })
+      await wipe()
       group = await newGroup(ann)
       await join(ben, 'owner')
       const a = (await rowOf(ann)).id
@@ -508,9 +519,209 @@ describe('records in a group', () => {
   })
 })
 
+describe('a closed door for every route', () => {
+  const token = async (u: string) => (await payload.login({ collection: 'users', data: { email: u, password: PW } })).token as string
+  const call = async (path: string, init: { method: string; token?: string; body?: unknown }) => {
+    const res = await handleEndpoints({
+      config: payload.config,
+      request: new Request(`http://localhost/api${path}`, {
+        method: init.method,
+        headers: { 'content-type': 'application/json', ...(init.token ? { Authorization: `JWT ${init.token}` } : {}) },
+        body: init.body ? JSON.stringify(init.body) : undefined,
+      }),
+    })
+    return { status: res.status, json: (await res.json().catch(() => ({}))) as Record<string, unknown> }
+  }
+  const count = async () => (await rows()).totalDocs
+
+  it('refuses REST: signed out, a stranger, a viewer, and a delete by the Owner', async () => {
+    const before = await count()
+    const body = { group: group.id, member: ref(dan), level: 'viewer' }
+    expect((await call('/share-members', { method: 'POST', body })).status).toBeGreaterThanOrEqual(400)
+    expect((await call('/share-members', { method: 'POST', body, token: await token('ben@example.com') })).status).toBeGreaterThanOrEqual(400)
+    await join(ben, 'viewer')
+    const mid = await count()
+    expect((await call('/share-members', { method: 'POST', body, token: await token('ben@example.com') })).status).toBeGreaterThanOrEqual(400)
+    const r = await rowOf(ben)
+    expect((await call(`/share-members/${r.id}`, { method: 'PATCH', body: { level: 'owner' }, token: await token('ben@example.com') })).status).toBeGreaterThanOrEqual(400)
+    expect((await call(`/share-members/${r.id}`, { method: 'DELETE', token: await token('ann@example.com') })).status).toBeGreaterThanOrEqual(400)
+    expect((await call(`/share-groups/${group.id}`, { method: 'DELETE', token: await token('ann@example.com') })).status).toBeGreaterThanOrEqual(400)
+    expect(await count()).toBe(mid)
+    expect(before).toBe(1)
+    expect((await rowOf(ben)).level).toBe('viewer')
+  })
+
+  it('refuses GraphQL: a stranger inviting and a viewer raising their own level', async () => {
+    await join(ben, 'viewer')
+    const r = await rowOf(ben)
+    const { schema } = configToSchema(payload.config)
+    const gql = async (query: string, who?: U) => {
+      const req = await createLocalReq({ user: who ? as(who) : undefined }, payload)
+      req.payloadAPI = 'GraphQL'
+      return (await graphql({ schema, source: query, contextValue: { req } })) as { errors?: unknown[] }
+    }
+    const invite = `mutation { createShareMember(data: { group: "${group.id}", level: viewer, status: invited, member: { relationTo: users, value: "${dan.id}" } }) { id } }`
+    expect((await gql(invite, cat)).errors?.length).toBeGreaterThan(0)
+    const raise = `mutation { updateShareMember(id: "${r.id}", data: { level: owner }) { id } }`
+    expect((await gql(raise, ben)).errors?.length).toBeGreaterThan(0)
+    expect((await gql(raise)).errors?.length).toBeGreaterThan(0)
+    expect((await rowOf(ben)).level).toBe('viewer')
+    expect((await rowOf(dan).catch(() => undefined)) ?? null).toBeNull()
+    // The same mutation works for an Owner, so the refusals above came from the rules and not from a typo.
+    const ok = await gql(invite, ann)
+    expect(ok.errors).toBeUndefined()
+    expect((await rowOf(dan)).status).toBe('invited')
+  })
+
+  it('refuses a bulk update, from a viewer and from an Owner', async () => {
+    await join(ben, 'viewer')
+    await join(dan, 'viewer')
+    for (const u of [ben, ann]) {
+      await refused(payload.update({ collection: 'share-members' as never, where: { level: { equals: 'viewer' } } as never, data: { level: 'manager' } as never, user: as(u), overrideAccess: false }))
+    }
+    expect((await rows({ level: { equals: 'manager' } })).totalDocs).toBe(0)
+    const res = await call('/share-members?where[level][equals]=viewer', { method: 'PATCH', body: { level: 'manager' }, token: await token('ann@example.com') })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect((await rows({ level: { equals: 'manager' } })).totalDocs).toBe(0)
+  })
+})
+
+describe('no way round the gate, even for server code', () => {
+  const server = (id: unknown, data: Record<string, unknown>) =>
+    payload.update({ collection: 'share-members' as never, id: id as never, data: data as never, overrideAccess: true }) as unknown as Promise<unknown>
+
+  it('never brings a removed member back, by status, level or notes', async () => {
+    const r = await join(ben, 'viewer')
+    await change(ann, r.id, { status: 'removed' })
+    expect(await refused(server(r.id, { status: 'active' }))).toMatch(/final/)
+    expect(await refused(server(r.id, { status: 'invited' }))).toMatch(/final/)
+    expect(await refused(server(r.id, { level: 'owner' }))).toMatch(/final/)
+    expect((await rowOf(ben)).status).toBe('removed')
+    expect(await roleIn(reqFor(ben), group.id)).toBeNull()
+  })
+
+  it('never turns an active member back into an invitation or revives an invite', async () => {
+    const r = await join(ben, 'viewer')
+    expect(await refused(server(r.id, { status: 'invited' }))).toMatch(/isn’t allowed/)
+    await invite(ann, { member: ref(dan), level: 'viewer' })
+    const d = await rowOf(dan)
+    await change(ann, d.id, { status: 'removed' })
+    expect(await refused(server(d.id, { status: 'invited' }))).toMatch(/final/)
+  })
+
+  it('asks the veto again for a raise from server code, and for a self-accept with a raised level', async () => {
+    const r = await join(ben, 'viewer')
+    answers.refuse = () => 'No.'
+    expect(await refused(server(r.id, { level: 'manager' }))).toBe('No.')
+    delete answers.refuse
+    await invite(ann, { member: ref(dan), level: 'viewer' })
+    const d = await rowOf(dan)
+    expect(await refused(change(dan, d.id, { status: 'active', level: 'owner' }))).toBeTruthy()
+    expect((await rowOf(dan)).status).toBe('invited')
+  })
+
+  it('never deletes, even with overrideAccess', async () => {
+    const r = await rowOf(ann)
+    for (const [collection, id] of [['share-groups', group.id], ['share-members', r.id]] as const) {
+      expect(await refused(payload.delete({ collection: collection as never, id: id as never, overrideAccess: true }))).toMatch(/never deleted/)
+      await refused(payload.delete({ collection: collection as never, where: { id: { exists: true } } as never, overrideAccess: true }))
+    }
+    expect((await rows()).totalDocs).toBe(1)
+    expect((await payload.find({ collection: 'share-groups' as never, overrideAccess: true })).totalDocs).toBe(1)
+  })
+})
+
+describe('what the hooks are given', () => {
+  it('passes plain ids and member references, and the id and data of a change', async () => {
+    seen.length = 0
+    await invite(ann, { group: { id: group.id }, member: { relationTo: 'users', value: { id: ben.id } }, level: 'viewer' })
+    const first = seen[0]! as { data: { group: unknown; member: unknown }; member: { group: unknown; member: unknown } }
+    expect(first.data.group).toBe(group.id)
+    expect(first.data.member).toEqual({ relationTo: 'users', value: ben.id })
+    expect(first.member.member).toEqual({ relationTo: 'users', value: ben.id })
+    seen.length = 0
+    const r = await rowOf(ben)
+    await change(ann, r.id, { level: 'manager' })
+    const second = seen[0]! as { id: unknown; data: { level: string } }
+    expect(String(second.id)).toBe(String(r.id))
+    expect(second.data.level).toBe('manager')
+  })
+
+  it('gives the audit hooks plain ids too', async () => {
+    const events: AuditEvent[] = []
+    answers.beforeInvite = () => undefined
+    await invite(ann, { member: ref(ben), level: 'viewer' })
+    void events
+    const r = await rowOf(ben)
+    expect(typeof r.id).not.toBe('object')
+  })
+})
+
+describe('members are keyed by their collection', () => {
+  it('does not give a user the membership of an organization with the same id, or the other way round', async () => {
+    await invite(ann, { member: ref(dan), level: 'manager' })
+    await change(dan, (await rowOf(dan)).id, { status: 'active' })
+    // someone who acts as an organization that happens to share dan's id
+    answers.identities = () => [{ relationTo: 'organizations', value: dan.id }]
+    expect(await roleIn(reqFor(ben), group.id)).toBeNull()
+    delete answers.identities
+    await invite(ann, { member: ref(org, 'organizations'), level: 'manager' })
+    await payload.update({ collection: 'share-members' as never, id: (await rowOf(org, 'organizations')).id as never, data: { status: 'active' } as never, overrideAccess: true })
+    answers.identities = () => [{ relationTo: 'users', value: org.id }]
+    expect(await roleIn(reqFor(ben), group.id)).toBeNull()
+  })
+})
+
+describe('the history', () => {
+  const events = async () =>
+    (await payload.find({ collection: 'share-member-events' as never, sort: 'createdAt', pagination: false, overrideAccess: true })).docs as unknown as { event: string; level: string; previousLevel?: string; previousStatus?: string; memberId: string; memberType: string }[]
+
+  it('records every invitation, acceptance, level change and removal', async () => {
+    const r = await join(ben, 'viewer')
+    await change(ann, r.id, { level: 'manager' })
+    await change(ben, r.id, { status: 'removed' })
+    const list = await events()
+    expect(list.map((e) => e.event)).toEqual(['invite', 'invite', 'accept', 'change-level', 'remove'])
+    expect(list[3]).toMatchObject({ level: 'manager', previousLevel: 'viewer', memberType: 'users', memberId: String(ben.id) })
+  })
+
+  it('records nothing for a change that was refused', async () => {
+    const before = (await events()).length
+    await refused(invite(dan, { member: ref(ben), level: 'viewer' }))
+    expect((await events()).length).toBe(before)
+  })
+
+  it('can’t be written, edited or deleted, by clients or by server code', async () => {
+    const e = (await payload.find({ collection: 'share-member-events' as never, overrideAccess: true })).docs[0] as { id: string }
+    expect(await refused(payload.create({ collection: 'share-member-events' as never, data: { group: group.id, membership: (await rowOf(ann)).id, memberType: 'users', memberId: 'x', event: 'invite' } as never, user: as(ann), overrideAccess: false }))).toBeTruthy()
+    expect(await refused(payload.update({ collection: 'share-member-events' as never, id: e.id as never, data: { level: 'x' } as never, overrideAccess: true }))).toMatch(/edited/)
+    expect(await refused(payload.delete({ collection: 'share-member-events' as never, id: e.id as never, overrideAccess: true }))).toMatch(/deleted/)
+  })
+
+  it('is read by a group’s Owners only', async () => {
+    await join(ben, 'manager')
+    const read = (u: U) => payload.find({ collection: 'share-member-events' as never, user: as(u), overrideAccess: false })
+    expect((await read(ann)).totalDocs).toBeGreaterThan(0)
+    expect(await refused(read(ben))).toBeTruthy()
+  })
+})
+
+describe('what a Viewer can see of the other members', () => {
+  it('shows a Viewer only the Owners and Managers, and their own row; a Manager sees everyone', async () => {
+    await join(ben, 'viewer')
+    await join(dan, 'viewer')
+    await join(cat, 'manager')
+    const names = async (u: U) =>
+      (await payload.find({ collection: 'share-members' as never, user: as(u), overrideAccess: false, pagination: false })).docs.map((d) => String(((d as unknown as { member: { value: { id?: unknown } | string } }).member.value as { id?: unknown })?.id ?? (d as unknown as { member: { value: unknown } }).member.value))
+    const sorted = (a: string[]) => [...a].sort()
+    expect(sorted(await names(ben))).toEqual(sorted([String(ann.id), String(cat.id), String(ben.id)]))
+    expect((await names(cat)).length).toBe(4)
+  })
+})
+
 describe('configuration', () => {
   it('stores the levels under the names the host gave them', () => {
-    const cfg = sharing({ kinds: [{ value: 'hobby' }], levels: { owner: { value: 'steward', label: 'Steward' }, viewer: { label: 'Reader' } } })({ collections: [] } as never) as unknown as {
+    const cfg = sharing({ kinds: [{ value: 'hobby' }], refuseMember: false, levels: { owner: { value: 'steward', label: 'Steward' }, viewer: { label: 'Reader' } } })({ collections: [] } as never) as unknown as {
       collections: { slug: string; fields: { name: string; options?: { value: string; label: string }[] }[] }[]
       custom: { sharing: { levels: Record<string, { value: string; label: string }> } }
     }
@@ -523,12 +734,17 @@ describe('configuration', () => {
     expect(cfg.custom.sharing.levels.owner?.value).toBe('steward')
   })
 
+  it('requires refuseMember, or an explicit false', () => {
+    expect(() => sharing({ kinds: [] } as never)({ collections: [] } as never)).toThrow(/refuseMember/)
+    expect(() => sharing({ kinds: [], refuseMember: false })({ collections: [] } as never)).not.toThrow()
+  })
+
   it('is off when disabled', () => {
-    const cfg = sharing({ enabled: false, kinds: [] })({ collections: [] } as never) as { collections: unknown[] }
+    const cfg = sharing({ enabled: false, kinds: [], refuseMember: false })({ collections: [] } as never) as { collections: unknown[] }
     expect(cfg.collections).toHaveLength(0)
   })
 
   it('refuses two levels with the same stored value', () => {
-    expect(() => sharing({ kinds: [], levels: { viewer: { value: 'owner' } } })({ collections: [] } as never)).toThrow(/different values/)
+    expect(() => sharing({ kinds: [], refuseMember: false, levels: { viewer: { value: 'owner' } } })({ collections: [] } as never)).toThrow(/different values/)
   })
 })

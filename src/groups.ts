@@ -29,10 +29,11 @@ export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       create: async ({ req, data }) => {
         const user = signedIn(req, s)
         if (!user || !opts.canCreateGroup) return false
-        if (!(await exactlyTrue(() => opts.canCreateGroup!({ req, user, data: data as Partial<ShareGroup> })))) return false
+        const plain = { ...(data as Record<string, unknown>), owner: refOf((data as { owner?: unknown })?.owner) ?? undefined } as Partial<ShareGroup>
+        if (!(await exactlyTrue(() => opts.canCreateGroup!({ req, user, data: plain })))) return false
         // Nobody makes a group that starts with someone else as Owner.
         try {
-          const owner = refOf((data as { owner?: unknown })?.owner) ?? { relationTo: s.users, value: user.id }
+          const owner = plain.owner ?? { relationTo: s.users, value: user.id }
           return (await identitiesOf(req, s)).some((r) => sameRef(r, owner))
         } catch {
           return false
@@ -78,6 +79,12 @@ export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       { name: 'lock', type: 'number', hidden: true, admin: { disabled: true }, access: { create: () => false, update: () => false } },
     ],
     hooks: {
+      // Groups are never deleted, not even by server code that skips access.
+      beforeDelete: [
+        () => {
+          throw refuse('Groups are never deleted.')
+        },
+      ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
           if (operation === 'create') {

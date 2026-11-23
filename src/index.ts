@@ -1,7 +1,7 @@
 import type { Config, Plugin } from 'payload'
 
 import { groupsCollection } from './groups.js'
-import { membersCollection } from './members.js'
+import { eventsCollection, membersCollection } from './members.js'
 import type { ResolvedSharing, Role, SharingOptions } from './types.js'
 
 export {
@@ -33,6 +33,8 @@ export const sharing =
   (options: SharingOptions): Plugin =>
   (config: Config): Config => {
     if (options.enabled === false) return config
+    if (options.refuseMember === undefined)
+      throw new Error('payload-plugin-sharing: pass `refuseMember`, a function that vetoes a member, or `refuseMember: false` to say there is none')
     const users = options.users ?? config.admin?.user ?? 'users'
     const levels = { ...DEFAULT_LEVELS }
     for (const role of Object.keys(levels) as Role[]) {
@@ -51,6 +53,6 @@ export const sharing =
     return {
       ...config,
       custom: { ...config.custom, sharing: resolved },
-      collections: [...(config.collections ?? []), groupsCollection(resolved, options), membersCollection(resolved, options)],
+      collections: [...(config.collections ?? []), groupsCollection(resolved, options), membersCollection(resolved, options), eventsCollection(resolved, options)],
     }
   }
