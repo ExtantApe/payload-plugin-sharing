@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: level changes on organization rows, release 0.1.0
+
+- Promises: a level change on an active organization row leaves a newly vetoed person out and succeeds, with the same answer whether or not a minor is behind it; the organization's own veto is still a plain 403; `peopleOf` is a function or exactly `false`; no audit payload or access-hook argument carries the left-out list or a left-out person's id.
+- Covered: in `test/plugin.test.ts` (114 tests): identical status, body, headers and audit at level change with and without a minor behind, the newly vetoed person added with the earlier ones kept, the organization's own refusal, each bad `peopleOf` value refused, and no left-out list or id in any audit event. A separate security review ran probes for both directions of a level change, a level-dependent veto, a cross-organization actor, junk `peopleOf` answers at runtime and all eight audit hooks, and found every answer identical.
+- Gaps skipped (and why): response timing (not promised); people added to an organization after it joins aren't re-checked (documented in the README).
+
 ## 2026-11-23: organizations at accept
 
 - Promises: an organization is never refused for a person behind it when a signed-in person founds or accepts for it, and the vetoed person gets no access through it; the acting person sees the same result either way; server code still sees reasons; a veto given as null, 0 or '' is refused at start.
