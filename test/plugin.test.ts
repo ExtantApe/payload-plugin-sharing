@@ -881,28 +881,99 @@ describe('the second review', () => {
     expect((await rows({ status: { equals: 'invited' } })).totalDocs).toBe(0)
   })
 
-  it('runs the veto for each person behind an organization at accept, and shows who is acting', async () => {
-    await make('orgkid@example.com', { minor: true, org: org.id })
+  it('lets an organization in at accept even with a vetoed person behind it, and still asks the veto for each person with the actor', async () => {
+    const orgkid = await make('orgkid@example.com', { minor: true, org: org.id })
     vetoSaw.length = 0
     await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' }) // the inviter is not told
     expect(vetoSaw).toEqual([])
     answers.canAccept = () => true
     const r = await rowOf(org, 'organizations')
-    expect(await refused(change(cat, r.id, { status: 'active' }))).toBe('Not available for this account.')
+    expect(await refused(change(cat, r.id, { status: 'active' }))).toBeNull()
     const person = vetoSaw.find((v) => v.subject === 'orgkid@example.com')
     expect(person).toBeTruthy()
     expect(person!.via).toEqual({ relationTo: 'organizations', value: org.id })
     expect(person!.action).toBe('accept')
     expect(String((person!.actor as { id: unknown }).id)).toBe(String(cat.id))
-    expect((await rowOf(org, 'organizations')).status).toBe('invited')
+    expect((await rowOf(org, 'organizations')).status).toBe('active')
+    // the adult behind the organization has the access; the vetoed person has none
+    expect(await roleIn(reqFor(cat), group.id)).toBe('viewer')
+    expect(await roleIn(reqFor(orgkid), group.id)).toBeNull()
+    expect(await groupIdsFor(reqFor(orgkid))).toEqual([])
+    expect(await canView(reqFor(orgkid), { shareGroup: group.id })).toBe(false)
   })
 
-  it('asks the per-person veto again on accept, so someone who joined the organization later is stopped', async () => {
-    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
-    await make('late@example.com', { minor: true, org: org.id }) // joins after the invitation
+  it('shows the acting adult the same thing whether or not a vetoed person is behind the organization', async () => {
+    const org2 = (await payload.create({ collection: 'organizations', data: { name: 'Other Co' } as never })) as unknown as U
+    const eve = await make('eve@example.com', { org: org2.id })
+    await make('orgkid@example.com', { minor: true, org: org.id })
+    const token = async (u: string) => (await payload.login({ collection: 'users', data: { email: u, password: PW } })).token as string
     answers.canAccept = () => true
-    expect(await refused(change(cat, (await rowOf(org, 'organizations')).id, { status: 'active' }))).toBe('Not available for this account.')
-    expect((await rowOf(org, 'organizations')).status).toBe('invited')
+    const mask = (s: string) => s.replace(/Made-up Co|Other Co/g, 'ORG').replace(/[0-9a-f]{24}/g, 'ID').replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, 'TIME')
+    const accept = async (o: U, who: string) => {
+      await invite(ann, { member: ref(o, 'organizations'), level: 'viewer' })
+      const r = await rowOf(o, 'organizations')
+      log.length = 0
+      const res = await handleEndpoints({
+        config: payload.config,
+        request: new Request(`http://localhost/api/share-members/${r.id}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', Authorization: `JWT ${await token(who)}` },
+          body: JSON.stringify({ status: 'active' }),
+        }),
+      })
+      const headers = [...res.headers.entries()].filter(([k]) => !['date', 'content-length', 'set-cookie'].includes(k)).sort()
+      return { status: res.status, body: mask(await res.text()), headers: mask(JSON.stringify(headers)), audit: [...log] }
+    }
+    const withMinor = await accept(org, 'cat@example.com')
+    const adultsOnly = await accept(org2, 'eve@example.com')
+    expect(withMinor.status).toBe(200)
+    expect(withMinor).toEqual(adultsOnly)
+    expect(withMinor.audit).toEqual(['before:accept', 'after:accept'])
+    expect(await roleIn(reqFor(eve), group.id)).toBe('viewer')
+  })
+
+  it('does the same when an adult founds a group for an organization', async () => {
+    const org2 = (await payload.create({ collection: 'organizations', data: { name: 'Other Co' } as never })) as unknown as U
+    const orgkid = await make('orgkid@example.com', { minor: true, org: org.id })
+    const fay = await make('fay@example.com', { staff: true, org: org.id })
+    const gus = await make('gus@example.com', { staff: true, org: org2.id })
+    const found = async (o: U, by: U) => {
+      log.length = 0
+      const g = await newGroup(by, { owner: ref(o, 'organizations') })
+      const made = await rows({ and: [{ group: { equals: g.id } }, { 'member.relationTo': { equals: 'organizations' } }] })
+      const row = made.docs[0] as unknown as { status: string; level: string }
+      return { g, shape: { status: row.status, level: row.level, count: made.totalDocs }, audit: [...log] }
+    }
+    const a = await found(org, fay)
+    const b = await found(org2, gus)
+    expect(a.shape).toEqual({ status: 'active', level: 'owner', count: 1 })
+    expect(a.shape).toEqual(b.shape)
+    expect(a.audit).toEqual(b.audit)
+    expect(await roleIn(reqFor(cat), a.g.id)).toBe('owner')
+    expect(await roleIn(reqFor(orgkid), a.g.id)).toBeNull()
+  })
+
+  it('still gives server code the reason when it adds an organization with a vetoed person behind it', async () => {
+    await make('orgkid@example.com', { minor: true, org: org.id })
+    const add = payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(org, 'organizations'), level: 'viewer' } as never, overrideAccess: true })
+    expect(await refused(add)).toBe('Not available for this account.')
+  })
+
+  it('does not let a client write who is left out', async () => {
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer', vetoedPeople: [String(cat.id)] })
+    answers.canAccept = () => true
+    const r = await rowOf(org, 'organizations')
+    await change(cat, r.id, { status: 'active', vetoedPeople: [String(cat.id)] })
+    expect(await roleIn(reqFor(cat), group.id)).toBe('viewer')
+  })
+
+  it('leaves a person who joined the organization later out at accept, without stopping it', async () => {
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    const late = await make('late@example.com', { minor: true, org: org.id }) // joins after the invitation
+    answers.canAccept = () => true
+    expect(await refused(change(cat, (await rowOf(org, 'organizations')).id, { status: 'active' }))).toBeNull()
+    expect((await rowOf(org, 'organizations')).status).toBe('active')
+    expect(await roleIn(reqFor(late), group.id)).toBeNull()
   })
 
   it('lets an organization of adults in, and asks the veto for each of them', async () => {
@@ -1264,6 +1335,10 @@ describe('configuration', () => {
   it('requires refuseMember, or an explicit false', () => {
     expect(() => sharing({ kinds: [] } as never)({ collections: [] } as never)).toThrow(/refuseMember/)
     expect(() => sharing({ kinds: [], refuseMember: false })({ collections: [] } as never)).not.toThrow()
+  })
+
+  it('turns the veto off only with exactly false, not null, 0 or an empty string', () => {
+    for (const off of [null, 0, '', undefined, 'no', true, {}]) expect(() => sharing({ kinds: [], refuseMember: off } as never)({ collections: [] } as never)).toThrow(/refuseMember/)
   })
 
   it('is off when disabled', () => {
