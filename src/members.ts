@@ -1,6 +1,6 @@
 import type { CollectionConfig, PayloadRequest, Where } from 'payload'
 
-import { exactlyTrue, refuse } from './groups.js'
+import { exactlyTrue, needTransaction, refuse } from './groups.js'
 import { idOf, identitiesOf, refOf, roleIn, roleOf, sameRef, signedIn, whereRefs, groupIdsFor } from './helpers.js'
 import {
   EVENTS,
@@ -135,17 +135,12 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
     }
   }
 
-  /** Server code can pass `disableTransaction`, which would split a change from its history row and skip the lock. */
-  const needTransaction = (req: PayloadRequest) => {
-    if (s.needsTransactions && !req.transactionID) throw refuse('This change needs a transaction, so it wasn’t made.')
-  }
-
   /**
    * Takes the group's lock and checks that an Owner is left once this one goes. Writing the group first means two
    * Owners leaving or demoting each other at once collide, and one of them is turned back.
    */
   async function keepAnOwner(req: PayloadRequest, group: GroupDoc, leaving: string | number) {
-    needTransaction(req)
+    await needTransaction(req, s)
     try {
       const fresh = (await req.payload.findByID({ collection: GROUPS as never, id: group.id, depth: 0, overrideAccess: true, req })) as unknown as { lock?: number }
       await req.payload.update({ collection: GROUPS as never, id: group.id, data: { lock: (fresh.lock ?? 0) + 1 } as never, overrideAccess: true, req })
@@ -288,7 +283,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
-          needTransaction(req)
+          await needTransaction(req, s)
           const now = new Date().toISOString()
           if (operation === 'create') {
             const group = await loadGroup(req, data.group)
@@ -301,6 +296,17 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             const empty = !(await req.payload.count({ collection: MEMBERS as never, where: { group: { equals: group.id } }, overrideAccess: true, req })).totalDocs
             // The founding Owner is the only member who starts active: the first row of a new group, for its owner.
             const founding = empty && !!owner && sameRef(owner, ref) && data.level === s.levels.owner.value
+            // Notes are for staff. Someone who isn't an Owner or Manager of the group can't set them, even if the host lets them invite.
+            if ('notes' in data && signedIn(req, s)) {
+              let staff = false
+              try {
+                const r = await roleIn(req, group.id)
+                staff = r === 'owner' || r === 'manager'
+              } catch {
+                staff = false
+              }
+              if (!staff) delete data.notes
+            }
             data.group = group.id
             data.member = ref
             data.status = founding ? 'active' : 'invited'

@@ -14,6 +14,11 @@ export async function exactlyTrue(check: () => unknown): Promise<boolean> {
   }
 }
 
+/** Server code can pass `disableTransaction`. The adapter can also hand back no transaction. Either way the change is refused, because it must be atomic with its lock and history rows. */
+export async function needTransaction(req: PayloadRequest, s: ResolvedSharing) {
+  if (s.needsTransactions && !(await req.transactionID)) throw refuse('This change needs a transaction, so it wasn’t made.')
+}
+
 export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {
   const memberTypes = s.memberTypes
   return {
@@ -87,6 +92,7 @@ export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
+          await needTransaction(req, s)
           if (operation === 'create') {
             if (typeof data.name !== 'string' || !data.name.trim()) throw refuse('A group needs a name.')
             data.name = data.name.trim()

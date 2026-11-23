@@ -5,7 +5,7 @@ import { graphql } from 'graphql'
 import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { assertTransactions, canEdit, canView, groupIdsFor, roleIn, sharedWhere, sharing, shareGroupField, type AuditEvent } from '../src/index.js'
+import { assertTransactions, canEdit, canView, groupIdsFor, identitiesOf, roleIn, sharedWhere, sharing, shareGroupField, type AuditEvent } from '../src/index.js'
 
 /**
  * A made-up site: users (staff may make groups, some belong to organizations, one is flagged `minor`), organizations,
@@ -1048,6 +1048,38 @@ describe('the third review', () => {
       expect(calls).toBe(1)
     })
 
+    it('drops the organization when peopleOf returns no list, and counts it as given with peopleOf: false', async () => {
+      await activeOrg()
+      answers.peopleOf = () => 'cat'
+      expect(await roleIn(reqFor(cat), group.id)).toBeNull()
+      delete answers.peopleOf
+      const custom = payload.config.custom as { sharing: Record<string, unknown> }
+      const open = { ...custom.sharing, peopleOf: false } as never
+      answers.identities = () => [{ relationTo: 'organizations', value: org.id }]
+      const refs = await identitiesOf(reqFor(ben), open)
+      expect(refs.some((r) => r.relationTo === 'organizations')).toBe(true)
+      expect((await identitiesOf(reqFor(ben))).some((r) => r.relationTo === 'organizations')).toBe(false)
+    })
+
+    it('asks peopleOf again on a new request, and doesn’t reuse a list that matched someone else on the same request', async () => {
+      await activeOrg()
+      let calls = 0
+      answers.peopleOf = () => {
+        calls++
+        return [{ relationTo: 'users', value: cat.id }]
+      }
+      expect(await roleIn(reqFor(cat), group.id)).toBe('manager')
+      expect(await roleIn(reqFor(cat), group.id)).toBe('manager')
+      expect(calls).toBe(2)
+      // the same request, the signed-in user switched to someone the list doesn't name
+      answers.identities = () => [{ relationTo: 'organizations', value: org.id }]
+      const req = reqFor(cat) as unknown as { user: unknown }
+      expect(await roleIn(req as never, group.id)).toBe('manager')
+      req.user = as(ben)
+      expect(await roleIn(req as never, group.id)).toBeNull()
+      expect(calls).toBe(3)
+    })
+
     it('can’t be used by someone acting for an organization to write notes on its row', async () => {
       await payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(org, 'organizations'), level: 'viewer', notes: 'staff note' } as never, user: as(ann), overrideAccess: false })
       answers.canAccept = () => true
@@ -1063,6 +1095,31 @@ describe('the third review', () => {
       await payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(ben), level: 'viewer', invitedBy: ann.id } as never, overrideAccess: true })
       const row = (await rows({ 'member.value': { equals: ben.id } })).docs[0] as unknown as { invitedBy?: unknown }
       expect(row.invitedBy ?? null).toBeNull()
+    })
+
+    it('refuses when the adapter hands back no transaction, even though the id is a promise', async () => {
+      const before = (await rows()).totalDocs
+      const req = await createLocalReq({ user: as(ann) }, payload)
+      ;(req as unknown as { transactionID: unknown }).transactionID = Promise.resolve(null)
+      expect(await refused(payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(ben), level: 'viewer' } as never, overrideAccess: true, req }))).toMatch(/transaction/)
+      expect((await rows()).totalDocs).toBe(before)
+    })
+
+    it('can’t make a group without a transaction, and leaves no ownerless group behind', async () => {
+      const count = async () => (await payload.count({ collection: 'share-groups' as never, overrideAccess: true })).totalDocs
+      const before = await count()
+      expect(await refused(payload.create({ collection: 'share-groups' as never, data: { name: 'Loose', kind: 'hobby', owner: ref(kid) } as never, overrideAccess: true, disableTransaction: true }))).toMatch(/transaction/)
+      expect(await count()).toBe(before)
+    })
+
+    it('keeps notes off a new invitation unless an Owner or Manager sent it', async () => {
+      answers.canInvite = () => true
+      await invite(dan, { member: ref(ben), level: 'viewer', notes: 'sneaky' })
+      expect(((await rows({ 'member.value': { equals: ben.id } })).docs[0] as unknown as { notes?: string }).notes ?? null).toBeNull()
+      await invite(ann, { member: ref(cat), level: 'viewer', notes: 'staff note' })
+      expect(((await rows({ 'member.value': { equals: cat.id } })).docs[0] as unknown as { notes?: string }).notes).toBe('staff note')
+      await payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(dan), level: 'viewer', notes: 'server note' } as never, overrideAccess: true })
+      expect(((await rows({ 'member.value': { equals: dan.id } })).docs[0] as unknown as { notes?: string }).notes).toBe('server note')
     })
 
     it('can’t skip the transaction, which would skip the lock and the history row', async () => {

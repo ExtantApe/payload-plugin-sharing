@@ -116,7 +116,7 @@ export type SharingOptions = {
   levels?: Partial<Record<Role, LevelConfig>>
   /**
    * Other identities the signed-in user acts as, such as the organizations they work for. A membership held by any of
-   * them counts for the user. An organization counts only if `peopleOf` lists the user for it; if `peopleOf` throws, it is dropped. A throw means access is refused. Default: only the user.
+   * them counts for the user. When `peopleOf` is a function, an organization counts only if it lists the user; if it throws or returns no list, the organization is dropped. With `peopleOf: false` or none, organizations count as given. A throw means access is refused. Default: only the user.
    */
   identities?: (args: { req: PayloadRequest; user: User }) => MemberRef[] | Promise<MemberRef[]>
   /**
