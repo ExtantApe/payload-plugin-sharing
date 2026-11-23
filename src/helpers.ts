@@ -89,7 +89,12 @@ export async function membershipsOf(req: PayloadRequest, options: { group?: stri
   if (options.group !== undefined) and.push({ group: { equals: options.group } })
   const found = await req.payload.find({ collection: MEMBERS as never, where: { and }, pagination: false, depth: 0, overrideAccess: true, req })
   const out: Membership[] = []
+  const me = String(signedIn(req, s)?.id ?? '')
   for (const d of found.docs as unknown as ShareMember[]) {
+    // An organization joined with someone behind it left out by the host's veto: that person gets nothing through it for this group.
+    const left = (d as unknown as { vetoedPeople?: unknown }).vetoedPeople
+    const member = refOf(d.member)
+    if (member && member.relationTo !== s.users && Array.isArray(left) && left.map(String).includes(me)) continue
     const role = roleOf(s, d.level)
     const group = idOf(d.group)
     if (role && group !== null) out.push({ id: d.id as string | number, group, level: d.level, role })

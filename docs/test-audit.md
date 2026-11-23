@@ -2,6 +2,19 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: organizations at accept
+
+- Promises: an organization is never refused for a person behind it when a signed-in person founds or accepts for it, and the vetoed person gets no access through it; the acting person sees the same result either way; server code still sees reasons; a veto given as null, 0 or '' is refused at start.
+- Covered: those, in `test/plugin.test.ts` (109 tests): REST accept with and without a vetoed person (status, body, headers, audit events), group founding for an organization, no access for the vetoed person, a person who joined later, a client unable to write the stored list.
+- Correction to the entry below: its claim of identical answers covers invite, invited-row level changes and duplicates. On an active row only the refusal's look (the plain 403 of a `canChangeLevel` no) is covered; an Owner can tell a refusal from a success, which the README says.
+- Gaps skipped (and why): response timing (not promised); someone who joins the organization after it accepts is not vetoed (documented).
+
+## 2026-11-23: veto at accept
+
+- Promises: an inviter can't tell a minor from an adult (answer, row shape, history) at invite, at level change on invited and active rows, and on duplicates; the veto is asked at accept; server code still sees reasons.
+- Covered: those, in `test/plugin.test.ts` (104 tests); the veto-first and org tests now run at accept.
+- Gaps skipped (and why): response timing differences (not promised).
+
 ## 2026-11-23: third review
 
 - Promises: `canRead` only adds rows; the plugin refuses to start without transactions; a member can't write staff notes on their own row; a removal can't carry a level change; the veto runs before the duplicate check; hidden fields can't be searched.

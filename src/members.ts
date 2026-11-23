@@ -1,4 +1,4 @@
-import type { CollectionConfig, PayloadRequest, Where } from 'payload'
+import { Forbidden, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
 
 import { exactlyTrue, needTransaction, refuse } from './groups.js'
 import { idOf, identitiesOf, refOf, roleIn, roleOf, sameRef, signedIn, whereRefs, groupIdsFor } from './helpers.js'
@@ -23,8 +23,9 @@ const GENERAL = 'This person can’t be added to this group.'
 const LIVE: MemberStatus[] = ['invited', 'active']
 type GroupDoc = ShareGroup & { id: string | number }
 
+// The left-out list is private to the plugin: it names people the veto refused, so it never goes to the host's audit hooks or hooks' arguments.
 const normalize = (doc: Record<string, unknown>): ShareMember => ({
-  ...(doc as unknown as ShareMember),
+  ...(({ vetoedPeople: _left, ...rest }) => rest)(doc as Record<string, unknown>) as unknown as ShareMember,
   group: idOf(doc.group) as string | number,
   member: refOf(doc.member) as MemberRef,
   invitedBy: idOf(doc.invitedBy),
@@ -100,10 +101,14 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
     }
   }
 
-  /** The host's veto. Only `null` or nothing goes ahead. */
-  async function vetoed(req: PayloadRequest, group: GroupDoc, ref: MemberRef, level: string, action: 'invite' | 'accept' | 'change-level') {
+  /**
+   * The host's veto. Only `null` or nothing goes ahead. With `quiet`, a person behind an organization who is refused is left out
+   * instead of stopping the organization: their ids come back, and the reason is never kept or shown.
+   */
+  async function vetoed(req: PayloadRequest, group: GroupDoc, ref: MemberRef, level: string, action: 'invite' | 'accept' | 'change-level', quiet = false): Promise<string[]> {
     const veto = opts.refuseMember
-    if (!veto) return
+    const left: string[] = []
+    if (!veto) return left
     const actor = signedIn(req, s) as RefuseArgs['actor']
     const ask1 = async (target: MemberRef, via?: MemberRef) => {
       const subject = await req.payload.findByID({ collection: target.relationTo as never, id: target.value, depth: 0, overrideAccess: true, req }).catch(() => null)
@@ -130,9 +135,17 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       for (const raw of people) {
         const person = refOf(raw)
         if (!person || person.relationTo !== s.users) throw refuse(GENERAL)
-        await ask1(person, ref)
+        if (!quiet) await ask1(person, ref)
+        else {
+          try {
+            await ask1(person, ref)
+          } catch {
+            left.push(String(person.value))
+          }
+        }
       }
     }
+    return left
   }
 
   /**
@@ -266,6 +279,8 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       { name: 'removedBy', type: 'relationship', relationTo: s.users, admin: { readOnly: true }, access: { read: staffOnly } },
       { name: 'notes', type: 'textarea', maxLength: 500, access: { read: staffOnly }, admin: { description: 'Seen by the group’s Owners and Managers only.' } },
       // Makes a second live membership for the same group and member fail in the database, not just in a check.
+      // Who behind an organization the veto left out when it joined. Nobody can read it through the API, not even staff; it only takes access away.
+      { name: 'vetoedPeople', type: 'json', admin: { disabled: true }, access: { read: () => false } },
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
@@ -315,8 +330,12 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             data.removedAt = null
             data.removedBy = null
             data.invitedBy = asker
-            // The veto runs before the duplicate check, so a vetoed person gets the same answer whether or not they are already in.
-            await vetoed(req, group, ref, data.level, 'invite')
+            // The veto is not asked when someone invites: an inviter could learn from the answer who it refuses (a minor, say). It is asked
+            // when the member accepts, where the answer goes to that person. Server code and a group's founding Owner are still asked here.
+            // An organization founding a group, or joining by a signed-in person's hand, is never refused for a person behind it: that
+            // person is left out of it instead, so the acting adult sees the same result whoever is behind the organization.
+            data.vetoedPeople = []
+            if (founding || !signedIn(req, s)) data.vetoedPeople = await vetoed(req, group, ref, data.level, 'invite', !!signedIn(req, s))
             const dup = await req.payload.find({
               collection: MEMBERS as never,
               where: { and: [{ group: { equals: group.id } }, { 'member.relationTo': { equals: ref.relationTo } }, { 'member.value': { equals: ref.value } }, { status: { in: LIVE } }] },
@@ -326,7 +345,18 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
               overrideAccess: true,
               req,
             })
-            if (dup.docs.length) throw refuse('That member is already in this group.')
+            if (dup.docs.length) {
+              // Say "already in this group" only to someone who can read that row. To anyone else a hidden invited row looks the same
+              // for every person, so the answer can't tell a minor from an adult.
+              let visible = !signedIn(req, s)
+              if (!visible) {
+                const seen = await req.payload
+                  .find({ collection: MEMBERS as never, where: { id: { equals: (dup.docs[0] as { id: unknown }).id } } as never, limit: 1, pagination: false, depth: 0, overrideAccess: false, req })
+                  .catch(() => null)
+                visible = !!seen?.docs.length
+              }
+              throw refuse(visible ? 'That member is already in this group.' : GENERAL)
+            }
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([group.id, ref.relationTo, ref.value])
             await run(opts.audit?.beforeInvite, { event: 'invite', phase: 'before', membership: normalize(data), by: asker, req }, true)
@@ -342,7 +372,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             const same = f === 'member' ? !!a && !!b && sameRef(a as MemberRef, b as MemberRef) : String(a ?? '') === String(b ?? '')
             if (!same) throw refuse('Only the level, status and notes can be changed.')
           }
-          for (const f of ['liveKey', 'acceptedAt', 'removedAt', 'removedBy']) delete data[f]
+          for (const f of ['liveKey', 'acceptedAt', 'removedAt', 'removedBy', 'vetoedPeople']) delete data[f]
           // A signed-in person who isn't an Owner or Manager of the group can't write notes: not on their own row when they accept
           // or leave, and not on an organization's row they act for. Server code can.
           if ('notes' in data && signedIn(req, s)) {
@@ -381,11 +411,25 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
           }
           if (status === 'active' && statusChanged) {
             data.acceptedAt = now
-            await vetoed(req, group, before.member, level, 'accept')
+            data.vetoedPeople = await vetoed(req, group, before.member, level, 'accept', !!signedIn(req, s))
             await run(opts.audit?.beforeAccept, { event: 'accept', phase: 'before', membership: after, previous: before, by: asker, req }, true)
           }
           if (levelChanged) {
-            await vetoed(req, group, before.member, level, 'change-level')
+            // A signed-in person changing someone's level isn't told why the veto refused: it would answer for any account. On an
+            // invited row the veto isn't asked at all, and acceptance decides. Server code still sees the reason.
+            if (!signedIn(req, s)) await vetoed(req, group, before.member, level, 'change-level')
+            else if (before.status === 'active') {
+              // Quiet: a person behind an organization who is newly refused is left out, and the change goes ahead, so the Owner
+              // gets the same answer whoever is behind it. Only a refusal of the member itself (or a broken peopleOf) is the plain 403.
+              try {
+                const now = await vetoed(req, group, before.member, level, 'change-level', true)
+                const kept = Array.isArray(originalDoc.vetoedPeople) ? (originalDoc.vetoedPeople as unknown[]).map(String) : []
+                const all = [...new Set([...kept, ...now])]
+                if (all.length !== kept.length) data.vetoedPeople = all
+              } catch {
+                throw new Forbidden(req.t)
+              }
+            }
             await run(opts.audit?.beforeChangeLevel, { event: 'change-level', phase: 'before', membership: after, previous: before, by: asker, req }, true)
           }
           return data
