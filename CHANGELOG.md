@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-11-23)
 
 - The repo, with the standard Payload plugin kit. Public since 2026-11-22.
 - The first version of the plugin (for Captive Origins' business accounts):

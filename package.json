@@ -1,7 +1,6 @@
 {
   "name": "@extantape/payload-plugin-sharing",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Sharing for Payload: people share records with other users and organizations, under access rules the host passes in.",
   "keywords": [
     "payload",
@@ -58,5 +57,8 @@
     "payload": "3.92.1",
     "typescript": "^5.9.0",
     "vitest": "^5.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
