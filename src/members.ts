@@ -8,6 +8,7 @@ import {
   MEMBERS,
   type AuditEvent,
   type AuditHook,
+  type RefuseArgs,
   type MemberArgs,
   type MemberRef,
   type MemberStatus,
@@ -64,8 +65,20 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
     try {
       const group = await loadGroup(req, member.group)
       if (!group) return false
-      const actorRole = await roleIn(req, group.id).catch(() => null)
+      const actorRole = await roleIn(req, group.id) // a throw (the identities hook, say) is a no, below
       return await exactlyTrue(() => fn({ req, user, group, id: extra.id, member, data: extra.data ?? member, actorRole, to: extra.to }))
+    } catch {
+      return false
+    }
+  }
+
+  /** Notes and who invited or removed someone are for the group's Owners and Managers. Everyone else, a child included, doesn't get them. */
+  const staffOnly = async ({ req, doc }: { req: PayloadRequest; doc?: Record<string, unknown> }) => {
+    try {
+      const gid = idOf(doc?.group)
+      if (gid === null || !signedIn(req, s)) return false
+      const role = await roleIn(req, gid)
+      return role === 'owner' || role === 'manager'
     } catch {
       return false
     }
@@ -88,17 +101,37 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
 
   /** The host's veto. Only `null` or nothing goes ahead. */
   async function vetoed(req: PayloadRequest, group: GroupDoc, ref: MemberRef, level: string, action: 'invite' | 'accept' | 'change-level') {
-    if (!opts.refuseMember) return
-    const subject = await req.payload.findByID({ collection: ref.relationTo as never, id: ref.value, depth: 0, overrideAccess: true, req }).catch(() => null)
-    if (!subject) throw refuse(GENERAL)
-    let why: unknown
-    try {
-      why = await opts.refuseMember({ req, group, subject: subject as never, ref, level, action })
-    } catch {
-      throw refuse(GENERAL)
+    const veto = opts.refuseMember
+    if (!veto) return
+    const actor = signedIn(req, s) as RefuseArgs['actor']
+    const ask1 = async (target: MemberRef, via?: MemberRef) => {
+      const subject = await req.payload.findByID({ collection: target.relationTo as never, id: target.value, depth: 0, overrideAccess: true, req }).catch(() => null)
+      if (!subject) throw refuse(GENERAL)
+      let why: unknown
+      try {
+        why = await veto({ req, group, subject: subject as never, ref: target, level, action, actor, via })
+      } catch {
+        throw refuse(GENERAL)
+      }
+      if (why === null || why === undefined) return
+      throw refuse(typeof why === 'string' && why.trim() ? why : GENERAL)
     }
-    if (why === null || why === undefined) return
-    throw refuse(typeof why === 'string' && why.trim() ? why : GENERAL)
+    await ask1(ref)
+    // An organization isn't one person: ask for each person behind it too, so the veto can't be walked around.
+    if (ref.relationTo !== s.users && opts.peopleOf) {
+      let people: unknown
+      try {
+        people = await opts.peopleOf({ req, organization: ref })
+      } catch {
+        throw refuse(GENERAL)
+      }
+      if (!Array.isArray(people)) throw refuse(GENERAL)
+      for (const raw of people) {
+        const person = refOf(raw)
+        if (!person || person.relationTo !== s.users) throw refuse(GENERAL)
+        await ask1(person, ref)
+      }
+    }
   }
 
   /**
@@ -148,7 +181,11 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
           const asks: Promise<boolean>[] = []
           if (next.level !== undefined && next.level !== before.level) asks.push(ask(opts.canChangeLevel, req, before, { ...ctx, to: String(next.level) }))
           if (next.status !== undefined && next.status !== before.status) {
-            if (next.status === 'active') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canAccept, req, before, ctx))
+            if (next.status === 'active') {
+              // A user accepts only their own invitation, never on their behalf. canAccept is for organization members only.
+              if (before.member.relationTo === s.users) asks.push(Promise.resolve(isSelf(req, before.member)))
+              else asks.push(ask(opts.canAccept, req, before, ctx))
+            }
             else if (next.status === 'removed') asks.push(isSelf(req, before.member) ? Promise.resolve(true) : ask(opts.canRemove ?? opts.canChangeLevel, req, before, ctx))
             else return false
           }
@@ -213,15 +250,22 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
         ],
         admin: { description: 'An invited member gets nothing until they accept. Removed is final: invite again to bring them back.' },
       },
-      { name: 'invitedBy', type: 'relationship', relationTo: s.users, admin: { readOnly: true } },
+      { name: 'invitedBy', type: 'relationship', relationTo: s.users, admin: { readOnly: true }, access: { read: staffOnly } },
       { name: 'acceptedAt', type: 'date', admin: { readOnly: true } },
       { name: 'removedAt', type: 'date', admin: { readOnly: true } },
-      { name: 'removedBy', type: 'relationship', relationTo: s.users, admin: { readOnly: true } },
-      { name: 'notes', type: 'textarea' },
+      { name: 'removedBy', type: 'relationship', relationTo: s.users, admin: { readOnly: true }, access: { read: staffOnly } },
+      { name: 'notes', type: 'textarea', maxLength: 500, access: { read: staffOnly }, admin: { description: 'Seen by the group’s Owners and Managers only.' } },
       // Makes a second live membership for the same group and member fail in the database, not just in a check.
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
+      // A bulk update can run each row in its own transaction, which would split a change from its history row.
+      beforeOperation: [
+        ({ args, operation }) => {
+          if (operation === 'update' && (args as { id?: unknown }).id === undefined) throw refuse('Memberships are changed one at a time.')
+          return args
+        },
+      ],
       // Nothing is ever deleted, not even by server code that skips access.
       beforeDelete: [
         () => {

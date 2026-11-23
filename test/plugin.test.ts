@@ -5,7 +5,7 @@ import { graphql } from 'graphql'
 import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { canEdit, canView, groupIdsFor, roleIn, sharedWhere, sharing, shareGroupField, type AuditEvent } from '../src/index.js'
+import { assertTransactions, canEdit, canView, groupIdsFor, roleIn, sharedWhere, sharing, shareGroupField, type AuditEvent } from '../src/index.js'
 
 /**
  * A made-up site: users (staff may make groups, some belong to organizations, one is flagged `minor`), organizations,
@@ -16,7 +16,8 @@ let payload: Payload
 let mongo: MongoMemoryReplSet
 const log: string[] = []
 const seen: { id?: unknown; data?: unknown; member?: unknown }[] = []
-const answers: { refuse?: () => unknown; beforeInvite?: () => void; canInvite?: () => unknown; identities?: () => unknown } = {}
+const vetoSaw: { subject: unknown; via: unknown; actor: unknown; action: string }[] = []
+const answers: { canAccept?: () => unknown; refuse?: () => unknown; beforeInvite?: () => void; canInvite?: () => unknown; identities?: () => unknown } = {}
 
 type U = { id: string | number }
 let ann: U, ben: U, cat: U, dan: U, kid: U, org: U
@@ -115,7 +116,13 @@ beforeAll(async () => {
           seen.push({ id, data, member })
           return actorRole === 'owner'
         },
-        refuseMember: ({ subject, group: g }) => {
+        peopleOf: async ({ organization }) => {
+          const found = await payload.find({ collection: 'users', where: { org: { equals: organization.value } }, pagination: false, overrideAccess: true })
+          return found.docs.map((d) => ({ relationTo: 'users', value: d.id }))
+        },
+        canAccept: () => (answers.canAccept ? (answers.canAccept() as boolean) : false),
+        refuseMember: ({ subject, group: g, via, actor, action }) => {
+          vetoSaw.push({ subject: (subject as { email?: string }).email ?? 'org', via, actor, action })
           if (answers.refuse) return answers.refuse() as string | null
           return (subject as { minor?: boolean }).minor && g.kind !== 'family' ? 'Not available for this account.' : null
         },
@@ -716,6 +723,122 @@ describe('what a Viewer can see of the other members', () => {
     const sorted = (a: string[]) => [...a].sort()
     expect(sorted(await names(ben))).toEqual(sorted([String(ann.id), String(cat.id), String(ben.id)]))
     expect((await names(cat)).length).toBe(4)
+  })
+})
+
+describe('the second review', () => {
+  const readRow = async (u: U, id: unknown) =>
+    (await payload.findByID({ collection: 'share-members' as never, id: id as never, user: as(u), overrideAccess: false, depth: 0 })) as unknown as Record<string, unknown>
+
+  it('keeps notes and who invited or removed someone from Viewers, a child included, and caps notes', async () => {
+    const fam = await newGroup(ann, { kind: 'family', name: 'Family' })
+    await payload.create({ collection: 'share-members' as never, data: { group: fam.id, member: ref(kid), level: 'viewer', notes: 'about the child' } as never, user: as(ann), overrideAccess: false })
+    await payload.create({ collection: 'share-members' as never, data: { group: fam.id, member: ref(ben), level: 'manager', notes: 'about ben' } as never, user: as(ann), overrideAccess: false })
+    const kidRow = (await rows({ and: [{ group: { equals: fam.id } }, { 'member.value': { equals: kid.id } }] })).docs[0] as unknown as { id: string }
+    await change(kid, kidRow.id, { status: 'active' })
+    const ownRow = await readRow(kid, kidRow.id)
+    expect(ownRow.level).toBe('viewer')
+    for (const f of ['notes', 'invitedBy', 'removedBy']) expect(ownRow[f]).toBeUndefined()
+    const benRow = (await rows({ and: [{ group: { equals: fam.id } }, { 'member.value': { equals: ben.id } }] })).docs[0] as unknown as { id: string }
+    await change(ben, benRow.id, { status: 'active' })
+    const asManager = await readRow(ben, benRow.id)
+    expect(asManager.notes).toBe('about ben')
+    expect(asManager.invitedBy).toBeTruthy()
+    const asOwner = await readRow(ann, benRow.id)
+    expect(asOwner.notes).toBe('about ben')
+  })
+
+  it('hides notes from a Viewer who lists the group, and refuses notes over the cap', async () => {
+    await join(ben, 'viewer')
+    await join(dan, 'viewer')
+    await payload.update({ collection: 'share-members' as never, id: (await rowOf(dan)).id as never, data: { notes: 'for owners' } as never, overrideAccess: true })
+    const listed = (await payload.find({ collection: 'share-members' as never, user: as(ben), overrideAccess: false, pagination: false, depth: 0 })).docs as unknown as Record<string, unknown>[]
+    expect(listed.length).toBeGreaterThan(0)
+    expect(listed.every((d) => d.notes === undefined && d.invitedBy === undefined && d.removedBy === undefined)).toBe(true)
+    expect(await refused(invite(ann, { member: ref(cat), level: 'viewer', notes: 'x'.repeat(501) }))).toBeTruthy()
+  })
+
+  it('lets a user accept only their own invitation, even when canAccept says yes', async () => {
+    answers.canAccept = () => true
+    await invite(ann, { member: ref(ben), level: 'viewer' })
+    const r = await rowOf(ben)
+    expect(await refused(change(ann, r.id, { status: 'active' }))).toBeTruthy()
+    expect(await refused(change(dan, r.id, { status: 'active' }))).toBeTruthy()
+    expect((await rowOf(ben)).status).toBe('invited')
+    await change(ben, r.id, { status: 'active' })
+  })
+
+  it('applies canAccept to organization members only', async () => {
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    const r = await rowOf(org, 'organizations')
+    expect(await refused(change(cat, r.id, { status: 'active' }))).toBeTruthy()
+    answers.canAccept = () => true
+    await change(cat, r.id, { status: 'active' })
+    expect((await rowOf(org, 'organizations')).status).toBe('active')
+  })
+
+  it('refuses without calling the host hook when the identities hook throws', async () => {
+    let called = 0
+    answers.canInvite = () => {
+      called++
+      return true
+    }
+    answers.identities = () => {
+      throw new Error('boom')
+    }
+    expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toBeTruthy()
+    expect(called).toBe(0)
+    expect((await rows({ status: { equals: 'invited' } })).totalDocs).toBe(0)
+  })
+
+  it('runs the veto for each person behind an organization, and shows who is acting', async () => {
+    const minor = await make('orgkid@example.com', { minor: true, org: org.id })
+    void minor
+    vetoSaw.length = 0
+    expect(await refused(invite(ann, { member: ref(org, 'organizations'), level: 'viewer' }))).toBe('Not available for this account.')
+    const person = vetoSaw.find((v) => v.subject === 'orgkid@example.com')
+    expect(person).toBeTruthy()
+    expect(person!.via).toEqual({ relationTo: 'organizations', value: org.id })
+    expect(String((person!.actor as { id: unknown }).id)).toBe(String(ann.id))
+    expect((await rows({ 'member.relationTo': { equals: 'organizations' } })).totalDocs).toBe(0)
+  })
+
+  it('asks the per-person veto again on accept, and lets an organization of adults in', async () => {
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    await make('late@example.com', { minor: true, org: org.id }) // joins after the invitation
+    answers.canAccept = () => true
+    expect(await refused(change(cat, (await rowOf(org, 'organizations')).id, { status: 'active' }))).toBe('Not available for this account.')
+  })
+
+  it('lets a minors-only veto pass a family group even for organization members', async () => {
+    await make('orgkid2@example.com', { minor: true, org: org.id })
+    const fam = await newGroup(ann, { kind: 'family', name: 'Family' })
+    await payload.create({ collection: 'share-members' as never, data: { group: fam.id, member: ref(org, 'organizations'), level: 'viewer' } as never, user: as(ann), overrideAccess: false })
+  })
+
+  it('refuses organizations as members without peopleOf or an explicit false', () => {
+    const base = { kinds: [], memberTypes: ['organizations'], refuseMember: () => null }
+    expect(() => sharing(base)({ collections: [] } as never)).toThrow(/peopleOf/)
+    expect(() => sharing({ ...base, peopleOf: false })({ collections: [] } as never)).not.toThrow()
+    expect(() => sharing({ ...base, peopleOf: () => [] })({ collections: [] } as never)).not.toThrow()
+    expect(() => sharing({ kinds: [], memberTypes: ['organizations'], refuseMember: false })({ collections: [] } as never)).not.toThrow()
+  })
+
+  it('refuses to run without transactions, and runs with them', async () => {
+    const real = { db: { beginTransaction: async () => null, connection: { db: { admin: () => ({ command: async () => ({ setName: 'rs0' }) }) } } } }
+    await expect(assertTransactions(real)).resolves.toBeUndefined()
+    await expect(assertTransactions(payload)).resolves.toBeUndefined()
+    const standalone = { db: { beginTransaction: async () => null, connection: { db: { admin: () => ({ command: async () => ({ isWritablePrimary: true }) }) } } } }
+    await expect(assertTransactions(standalone)).rejects.toThrow(/transactions/)
+    await expect(assertTransactions({ db: { beginTransaction: async () => null, transactionOptions: false } })).rejects.toThrow(/transactions/)
+    await expect(assertTransactions({ db: {} })).rejects.toThrow(/transactions/)
+  })
+
+  it('refuses a bulk member update, even for server code, so a change and its history row stay together', async () => {
+    await join(ben, 'viewer')
+    await join(dan, 'viewer')
+    expect(await refused(payload.update({ collection: 'share-members' as never, where: { level: { equals: 'viewer' } } as never, data: { notes: 'bulk' } as never, overrideAccess: true }))).toMatch(/one at a time/)
+    expect((await rows({ notes: { equals: 'bulk' } })).totalDocs).toBe(0)
   })
 })
 

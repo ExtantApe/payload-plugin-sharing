@@ -75,6 +75,13 @@ export type RefuseArgs = {
   ref: MemberRef
   level: string
   action: 'invite' | 'accept' | 'change-level'
+  /** The signed-in user making the change, or null for server code. */
+  actor: ({ id: string | number } & Record<string, unknown>) | null
+  /**
+   * Set when the member is an organization: the veto is asked once for the organization itself, and once for each person
+   * `peopleOf` lists behind it, with `subject` the person and `via` the organization.
+   */
+  via?: MemberRef
 }
 
 export type RefuseMember = (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
@@ -109,6 +116,14 @@ export type SharingOptions = {
    * them counts for the user. A throw means access is refused. Default: only the user.
    */
   identities?: (args: { req: PayloadRequest; user: User }) => MemberRef[] | Promise<MemberRef[]>
+  /**
+   * The people behind an organization, asked whenever an organization is invited, accepts or changes level, so that
+   * `refuseMember` runs for each of them. Required when `memberTypes` adds anything beyond users and there is a veto;
+   * pass `false` to say plainly that organizations are not checked person by person. Only the people listed at that
+   * moment are checked: someone who joins the organization later is not, so the host must ask its veto again when people
+   * join, or keep organizations out of groups where a veto matters.
+   */
+  peopleOf?: ((args: { req: PayloadRequest; organization: MemberRef }) => MemberRef[] | Promise<MemberRef[]>) | false
   /** Who may make a group. Only an exact `true` counts. The group's owner must also be the asker or one of their identities. */
   canCreateGroup?: Check<GroupArgs>
   /** Who may invite someone to a group. Only an exact `true` counts; a throw, a truthy value or no hook is a no. */
@@ -117,7 +132,7 @@ export type SharingOptions = {
   canChangeLevel?: Check<MemberArgs>
   /** Who may remove someone else. Default: whoever `canChangeLevel` allows. Anyone may always leave or decline for themselves. */
   canRemove?: Check<MemberArgs>
-  /** Who may accept an invitation for an organization. A user always accepts their own. Default: nobody. */
+  /** Who may accept an invitation for an organization member. A user member can only be accepted by that user, never on their behalf. Default: nobody. */
   canAccept?: Check<MemberArgs>
   /**
    * Who may read memberships. Default: your own, every row in groups where you are an Owner or Manager, and only the

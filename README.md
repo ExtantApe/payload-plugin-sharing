@@ -2,7 +2,7 @@
 
 Sharing for Payload: people share records with other users and organizations, under access rules the host passes in.
 
-**Status:** first version, version 0.x, not on npm yet. It is tested against real Payload 3.92 with an in-memory MongoDB replica set (61 tests, including two requests at once and refusals over REST, GraphQL and bulk update). It has not been used in a live site yet, and the admin screens have not been checked in a browser. It needs a database that supports transactions (a MongoDB replica set), because the last-Owner rule relies on one.
+**Status:** first version, version 0.x, not on npm yet. It is tested against real Payload 3.92 with an in-memory MongoDB replica set (72 tests, including two requests at once and refusals over REST, GraphQL and bulk update). It has not been used in a live site yet, and the admin screens have not been checked in a browser. It needs a database that supports transactions (a MongoDB replica set), because the last-Owner rule and the history rely on them. On start it checks, and refuses to run without them.
 
 ## What it does
 
@@ -59,7 +59,8 @@ export default buildConfig({
 - `kinds`: the group kinds. With none, no group can be made.
 - `levels`: rename or relabel `owner`, `manager` and `viewer`. The stored values must differ.
 - `memberTypes`, `identities`: let organizations be members, and say which ones a signed-in user acts for. A membership held by an identity counts for the user.
-- `canCreateGroup`, `canInvite`, `canChangeLevel`: only an exact `true` allows. A truthy value, a throw or no hook is a no. `canRemove` (default: `canChangeLevel`) and `canAccept` (default: nobody; for organizations) work the same way. Each gets the group, the membership and `actorRole`, the asker's own role in the group.
+- `peopleOf`: required with organizations (or `false`). Lists the people behind an organization, so `refuseMember` runs for each of them, with `via` set to the organization and `actor` set to who is making the change. **Risk:** only the people listed at that moment are checked. Someone who joins the organization later gets the group's access through it without the veto being asked, so ask your veto again when people join, or keep organizations out of groups where it matters, such as anything with children.
+- `canCreateGroup`, `canInvite`, `canChangeLevel`: only an exact `true` allows. A truthy value, a throw or no hook is a no. `canRemove` (default: `canChangeLevel`) and `canAccept` (default: nobody; for organization members only) work the same way. A user member can only ever accept their own invitation. If the `identities` hook throws, every host hook is skipped and the change is refused. Each gets the group, the membership and `actorRole`, the asker's own role in the group.
 - `refuseMember`: required. A veto asked on every invitation, acceptance and level change, even from server code. Return `null` to go ahead, or a reason to refuse. Anything else refuses with a general message. A host can use it to keep minors out of every group kind except family. Pass `refuseMember: false` to say you have no veto.
   **Warning:** the reason is shown to whoever was refused. Don't write a reason that gives away something private, such as an age or a guardian link. Return a general one like `Not available for this account.`
 - `canRead`: who reads memberships. Default: your own rows, every row in groups where you are Owner or Manager, and only the Owners and Managers of groups where you are a Viewer. Return a `where` to widen it.
@@ -76,6 +77,8 @@ export default buildConfig({
 
 - A record can be in one group (or several, with `hasMany`). Records don't inherit from parent groups.
 - Hooks get plain ids and `{ relationTo, value }` references, plus the `id` and `data` of the change.
+- `notes`, `invitedBy` and `removedBy` on a membership are readable by the group's Owners and Managers only, and notes are capped at 500 characters.
+- Memberships change one at a time; a bulk update is refused.
 - Invitations are rows in `share-members`. The plugin sends no email.
 
 ## Build and test
