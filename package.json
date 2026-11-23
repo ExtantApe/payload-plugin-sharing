@@ -2,7 +2,7 @@
   "name": "@extantape/payload-plugin-sharing",
   "version": "0.0.0",
   "private": true,
-  "description": "Sharing for Payload: people share records with other users and organizations, under access rules the host passes in. A skeleton for now.",
+  "description": "Sharing for Payload: people share records with other users and organizations, under access rules the host passes in.",
   "keywords": [
     "payload",
     "payload-plugin",
@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@payloadcms/db-mongodb": "3.92.1",
+    "@payloadcms/graphql": "3.92.1",
     "@types/node": "^24.0.0",
     "graphql": "^16.14.2",
     "mongodb-memory-server": "^11.3.0",
