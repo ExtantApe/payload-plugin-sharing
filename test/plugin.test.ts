@@ -285,11 +285,33 @@ describe('inviting', () => {
 })
 
 describe('the host veto', () => {
-  it('blocks a minor outside a family group on invite, even for server code that skips access', async () => {
-    expect(await refused(invite(ann, { member: ref(kid), level: 'viewer' }))).toBe('Not available for this account.')
-    expect(
-      await refused(payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(kid), level: 'viewer' } as never, overrideAccess: true })),
-    ).toBe('Not available for this account.')
+  const serverInvite = (u: U) => payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(u), level: 'viewer' } as never, overrideAccess: true })
+
+  it('is not asked when someone invites: the inviter gets the same answer and row for a minor and an adult', async () => {
+    vetoSaw.length = 0
+    const shape = (row: Record<string, unknown>) => Object.keys(row).filter((k) => !['id', 'member', 'createdAt', 'updatedAt', 'invitedAt'].includes(k)).sort()
+    const forKid = await invite(ann, { member: ref(kid), level: 'viewer' })
+    const forBen = await invite(ann, { member: ref(ben), level: 'viewer' })
+    expect(vetoSaw).toEqual([])
+    expect(shape(forKid)).toEqual(shape(forBen))
+    expect([forKid.status, forKid.level]).toEqual([forBen.status, forBen.level])
+    const history = (await payload.find({ collection: 'share-member-events' as never, where: { event: { equals: 'invite' } } as never, pagination: false, overrideAccess: true })).docs as unknown as Record<string, unknown>[]
+    const kidEvent = history.find((e) => e.memberId === String(kid.id))!
+    const benEvent = history.find((e) => e.memberId === String(ben.id))!
+    expect(Object.keys(kidEvent).sort()).toEqual(Object.keys(benEvent).sort())
+    expect([kidEvent.level, kidEvent.status]).toEqual([benEvent.level, benEvent.status])
+  })
+
+  it('stops the minor at accept, with the reason shown to them, and leaves the row invited', async () => {
+    await invite(ann, { member: ref(kid), level: 'viewer' })
+    const r = await rowOf(kid)
+    expect(await refused(change(kid, r.id, { status: 'active' }))).toBe('Not available for this account.')
+    expect((await rowOf(kid)).status).toBe('invited')
+  })
+
+  it('still asks on invite, and shows the reason, for server code that skips access', async () => {
+    expect(await refused(serverInvite(kid))).toBe('Not available for this account.')
+    await serverInvite(ben)
   })
 
   it('lets a minor into a family group', async () => {
@@ -306,18 +328,56 @@ describe('the host veto', () => {
       () => '   ',
     ]) {
       answers.refuse = answer
-      expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toBe('This person can’t be added to this group.')
+      expect(await refused(serverInvite(ben))).toBe('This person can’t be added to this group.')
+      await invite(ann, { member: ref(dan), level: 'viewer' })
+      expect(await refused(change(dan, (await rowOf(dan)).id, { status: 'active' }))).toBe('This person can’t be added to this group.')
+      await change(dan, (await rowOf(dan)).id, { status: 'removed' })
     }
   })
 
-  it('is asked again on accept and on a level change', async () => {
+  it('is asked on accept, and on a level change of an active row, where the inviter sees only a plain refusal', async () => {
     await invite(ann, { member: ref(ben), level: 'viewer' })
     answers.refuse = () => 'Paused.'
     expect(await refused(change(ben, (await rowOf(ben)).id, { status: 'active' }))).toBe('Paused.')
     delete answers.refuse
     await change(ben, (await rowOf(ben)).id, { status: 'active' })
+    const eventsBefore = (await payload.count({ collection: 'share-member-events' as never, overrideAccess: true })).totalDocs
+    // The same refusal a host's canChangeLevel gives: dan holds no right to change levels.
+    await join(dan, 'viewer')
+    const plain = await refused(change(dan, (await rowOf(ben)).id, { level: 'manager' }))
     answers.refuse = () => 'Paused.'
-    expect(await refused(change(ann, (await rowOf(ben)).id, { level: 'manager' }))).toBe('Paused.')
+    const vetoedMessage = await refused(change(ann, (await rowOf(ben)).id, { level: 'manager' }))
+    expect(vetoedMessage).toBe(plain)
+    expect(vetoedMessage).not.toBe('Paused.')
+    expect((await rowOf(ben)).level).toBe('viewer')
+    const eventsAfter = (await payload.count({ collection: 'share-member-events' as never, overrideAccess: true })).totalDocs
+    expect(eventsAfter).toBe(eventsBefore + 2) // dan's invite and accept only; the refused change left nothing
+  })
+
+  it('doesn’t ask the veto about a level change on an invited row, so the inviter learns nothing; acceptance decides', async () => {
+    await invite(ann, { member: ref(kid), level: 'viewer' })
+    await invite(ann, { member: ref(ben), level: 'viewer' })
+    vetoSaw.length = 0
+    const a = await change(ann, (await rowOf(kid)).id, { level: 'manager' })
+    const b = await change(ann, (await rowOf(ben)).id, { level: 'manager' })
+    expect(vetoSaw).toEqual([])
+    expect(a.level).toBe(b.level)
+    expect(await refused(change(kid, (await rowOf(kid)).id, { status: 'active' }))).toBe('Not available for this account.')
+    expect((await rowOf(kid)).status).toBe('invited')
+  })
+
+  it('says a member is already in the group only to someone who can read that row', async () => {
+    answers.canInvite = () => true
+    await invite(ann, { member: ref(kid), level: 'viewer' }) // a hidden invited row
+    await invite(ann, { member: ref(ben), level: 'viewer' }) // another, for an adult
+    await join(dan, 'viewer') // dan is a Viewer: can't read invited rows
+    const asViewerKid = await refused(invite(dan, { member: ref(kid), level: 'viewer' }))
+    const asViewerBen = await refused(invite(dan, { member: ref(ben), level: 'viewer' }))
+    expect(asViewerKid).toBe(asViewerBen)
+    expect(asViewerKid).not.toMatch(/already/)
+    // An Owner reads every row, so they may be told.
+    expect(await refused(invite(ann, { member: ref(kid), level: 'viewer' }))).toMatch(/already/)
+    expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toMatch(/already/)
   })
 
   it('stops the change when a before audit hook throws', async () => {
@@ -334,13 +394,6 @@ describe('the host veto', () => {
     }
     await invite(ann, { member: ref(ben), level: 'viewer' })
     expect((await rowOf(ben)).status).toBe('invited')
-  })
-
-  it('gives the same answer to a vetoed person whether or not they are already in the group', async () => {
-    await invite(ann, { member: ref(ben), level: 'viewer' }) // live in the group
-    answers.refuse = () => 'Paused.'
-    expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toBe('Paused.')
-    expect(await refused(invite(ann, { member: ref(dan), level: 'viewer' }))).toBe('Paused.')
   })
 })
 
@@ -828,16 +881,20 @@ describe('the second review', () => {
     expect((await rows({ status: { equals: 'invited' } })).totalDocs).toBe(0)
   })
 
-  it('runs the veto for each person behind an organization, and shows who is acting', async () => {
-    const minor = await make('orgkid@example.com', { minor: true, org: org.id })
-    void minor
+  it('runs the veto for each person behind an organization at accept, and shows who is acting', async () => {
+    await make('orgkid@example.com', { minor: true, org: org.id })
     vetoSaw.length = 0
-    expect(await refused(invite(ann, { member: ref(org, 'organizations'), level: 'viewer' }))).toBe('Not available for this account.')
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' }) // the inviter is not told
+    expect(vetoSaw).toEqual([])
+    answers.canAccept = () => true
+    const r = await rowOf(org, 'organizations')
+    expect(await refused(change(cat, r.id, { status: 'active' }))).toBe('Not available for this account.')
     const person = vetoSaw.find((v) => v.subject === 'orgkid@example.com')
     expect(person).toBeTruthy()
     expect(person!.via).toEqual({ relationTo: 'organizations', value: org.id })
-    expect(String((person!.actor as { id: unknown }).id)).toBe(String(ann.id))
-    expect((await rows({ 'member.relationTo': { equals: 'organizations' } })).totalDocs).toBe(0)
+    expect(person!.action).toBe('accept')
+    expect(String((person!.actor as { id: unknown }).id)).toBe(String(cat.id))
+    expect((await rowOf(org, 'organizations')).status).toBe('invited')
   })
 
   it('asks the per-person veto again on accept, so someone who joined the organization later is stopped', async () => {

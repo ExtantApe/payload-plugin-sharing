@@ -1,4 +1,4 @@
-import type { CollectionConfig, PayloadRequest, Where } from 'payload'
+import { Forbidden, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
 
 import { exactlyTrue, needTransaction, refuse } from './groups.js'
 import { idOf, identitiesOf, refOf, roleIn, roleOf, sameRef, signedIn, whereRefs, groupIdsFor } from './helpers.js'
@@ -315,8 +315,9 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             data.removedAt = null
             data.removedBy = null
             data.invitedBy = asker
-            // The veto runs before the duplicate check, so a vetoed person gets the same answer whether or not they are already in.
-            await vetoed(req, group, ref, data.level, 'invite')
+            // The veto is not asked when someone invites: an inviter could learn from the answer who it refuses (a minor, say). It is asked
+            // when the member accepts, where the answer goes to that person. Server code and a group's founding Owner are still asked here.
+            if (founding || !signedIn(req, s)) await vetoed(req, group, ref, data.level, 'invite')
             const dup = await req.payload.find({
               collection: MEMBERS as never,
               where: { and: [{ group: { equals: group.id } }, { 'member.relationTo': { equals: ref.relationTo } }, { 'member.value': { equals: ref.value } }, { status: { in: LIVE } }] },
@@ -326,7 +327,18 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
               overrideAccess: true,
               req,
             })
-            if (dup.docs.length) throw refuse('That member is already in this group.')
+            if (dup.docs.length) {
+              // Say "already in this group" only to someone who can read that row. To anyone else a hidden invited row looks the same
+              // for every person, so the answer can't tell a minor from an adult.
+              let visible = !signedIn(req, s)
+              if (!visible) {
+                const seen = await req.payload
+                  .find({ collection: MEMBERS as never, where: { id: { equals: (dup.docs[0] as { id: unknown }).id } } as never, limit: 1, pagination: false, depth: 0, overrideAccess: false, req })
+                  .catch(() => null)
+                visible = !!seen?.docs.length
+              }
+              throw refuse(visible ? 'That member is already in this group.' : GENERAL)
+            }
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([group.id, ref.relationTo, ref.value])
             await run(opts.audit?.beforeInvite, { event: 'invite', phase: 'before', membership: normalize(data), by: asker, req }, true)
@@ -385,7 +397,16 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             await run(opts.audit?.beforeAccept, { event: 'accept', phase: 'before', membership: after, previous: before, by: asker, req }, true)
           }
           if (levelChanged) {
-            await vetoed(req, group, before.member, level, 'change-level')
+            // A signed-in person changing someone's level isn't told why the veto refused: it would answer for any account. On an
+            // invited row the veto isn't asked at all, and acceptance decides. Server code still sees the reason.
+            if (!signedIn(req, s)) await vetoed(req, group, before.member, level, 'change-level')
+            else if (before.status === 'active') {
+              try {
+                await vetoed(req, group, before.member, level, 'change-level')
+              } catch {
+                throw new Forbidden(req.t)
+              }
+            }
             await run(opts.audit?.beforeChangeLevel, { event: 'change-level', phase: 'before', membership: after, previous: before, by: asker, req }, true)
           }
           return data

@@ -144,8 +144,9 @@ export type SharingOptions = {
    */
   canRead?: (args: { req: PayloadRequest; user: User }) => boolean | Where | Promise<boolean | Where>
   /**
-   * A veto the host controls, asked on every invitation, acceptance and level change, even for server code that skips
-   * access. Return `null` or nothing to go ahead, or a reason to refuse. A throw, `false` or anything else refuses with
+   * A veto the host controls, asked on acceptance and on a level change of an active member, even for server code that skips
+   * access. It is not asked when a signed-in user invites, so the inviter can't learn who it refuses; server code and a group's
+   * founding Owner are still asked on invite. A signed-in caller whose level change it refuses gets the plain 403. Return `null` or nothing to go ahead, or a reason to refuse. A throw, `false` or anything else refuses with
    * a general reason. The reason is shown to whoever was refused, so never put a reason that reveals something private,
    * such as an age. Required: pass `false` to say plainly that the host has no veto.
    */

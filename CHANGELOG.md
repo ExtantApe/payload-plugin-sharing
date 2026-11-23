@@ -2,13 +2,14 @@
 
 ## Unreleased
 
+- The veto moves from invite to accept, so an inviter can't learn who it refuses (a minor, say) by inviting them. An invitation always succeeds for a signed-in user and looks the same for everyone; the reason goes to the person accepting. A level change on an invited row doesn't ask it; on an active row a refusal looks exactly like a `canChangeLevel` no, with nothing written and no history row. "Already in this group" is said only to someone who can read that row. Server code and a group's founding Owner are still asked on invite and see reasons. Tested: 104 tests, including that an inviter gets the same answer, row and history for a minor and an adult at invite, at level change on invited and active rows, and on duplicates; the full suite passed 5 runs in a row. Not tested: a live site.
 - The two `find` calls that pass the request (the last-Owner check and the duplicate-invite check) no longer paginate, so no count query rides beside them on a transaction's session, which could intermittently fail with NoSuchTransaction. Tested: 101 tests, including one that records every `find` made with a request and requires `pagination: false`; the full suite passed 5 runs in a row. Not tested: a live site.
 - The repo, with the standard Payload plugin kit. Public since 2026-11-22.
 - The first version of the plugin (for Captive Origins' business accounts):
   - `share-groups` and `share-members` collections, with Owner, Manager and Viewer levels the host can rename, and member types the host can extend to organizations.
   - A group always keeps an active Owner. The last Owner can't leave or be demoted, and two Owners changing each other at once leave one.
   - Host hooks `canCreateGroup`, `canInvite`, `canChangeLevel`, `canRemove` and `canAccept`, all failing closed on anything but an exact `true`.
-  - A required `refuseMember` veto (or an explicit `false`) on invite, accept and level change, applied to server code too. The reason is shown to the person refused, so the README warns against reasons that reveal an age.
+  - A required `refuseMember` veto (or an explicit `false`) on accept and on level changes of active members (invite too for server code, see below), applied to server code too. The reason is shown to the person refused, so the README warns against reasons that reveal an age.
   - An append-only `share-member-events` history of every invite, accept, level change and removal, written in the same transaction.
   - Second review fixes: `notes`, `invitedBy` and `removedBy` are readable by Owners and Managers only (notes capped at 500); a user accepts only their own invitation and `canAccept` is for organizations; a throwing `identities` hook refuses before any host hook runs; `refuseMember` runs for each person behind an organization (`peopleOf`, required with organizations); the plugin refuses to start without database transactions; bulk member updates are refused.
   - Deletes always throw, even with `overrideAccess`. Hooks receive plain ids and references, and the `id` and `data` of the change. Viewers see only Owners and Managers by default.
