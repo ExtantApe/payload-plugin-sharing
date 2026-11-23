@@ -23,8 +23,9 @@ const GENERAL = 'This person can’t be added to this group.'
 const LIVE: MemberStatus[] = ['invited', 'active']
 type GroupDoc = ShareGroup & { id: string | number }
 
+// The left-out list is private to the plugin: it names people the veto refused, so it never goes to the host's audit hooks or hooks' arguments.
 const normalize = (doc: Record<string, unknown>): ShareMember => ({
-  ...(doc as unknown as ShareMember),
+  ...(({ vetoedPeople: _left, ...rest }) => rest)(doc as Record<string, unknown>) as unknown as ShareMember,
   group: idOf(doc.group) as string | number,
   member: refOf(doc.member) as MemberRef,
   invitedBy: idOf(doc.invitedBy),
@@ -418,8 +419,13 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             // invited row the veto isn't asked at all, and acceptance decides. Server code still sees the reason.
             if (!signedIn(req, s)) await vetoed(req, group, before.member, level, 'change-level')
             else if (before.status === 'active') {
+              // Quiet: a person behind an organization who is newly refused is left out, and the change goes ahead, so the Owner
+              // gets the same answer whoever is behind it. Only a refusal of the member itself (or a broken peopleOf) is the plain 403.
               try {
-                await vetoed(req, group, before.member, level, 'change-level')
+                const now = await vetoed(req, group, before.member, level, 'change-level', true)
+                const kept = Array.isArray(originalDoc.vetoedPeople) ? (originalDoc.vetoedPeople as unknown[]).map(String) : []
+                const all = [...new Set([...kept, ...now])]
+                if (all.length !== kept.length) data.vetoedPeople = all
               } catch {
                 throw new Forbidden(req.t)
               }

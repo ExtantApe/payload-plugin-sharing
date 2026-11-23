@@ -60,7 +60,9 @@ const join = async (u: U, level: string) => {
 const wipe = async () => {
   for (const c of ['share-member-events', 'share-members', 'share-groups']) await (payload.db as unknown as { collections: Record<string, { deleteMany: (f: object) => Promise<unknown> }> }).collections[c]!.deleteMany({})
 }
+const captured: AuditEvent[] = []
 const record = (e: AuditEvent) => {
+  captured.push(e)
   log.push(`${e.phase}:${e.event}`)
 }
 
@@ -161,6 +163,7 @@ afterAll(async () => {
 beforeEach(async () => {
   for (const key of Object.keys(answers)) delete (answers as Record<string, unknown>)[key]
   log.length = 0
+  captured.length = 0
   await wipe()
   for (const c of ['notes', 'users', 'organizations'])
     await payload.delete({ collection: c as never, where: { id: { exists: true } }, overrideAccess: true })
@@ -992,6 +995,91 @@ describe('the second review', () => {
     const made = await rows({ and: [{ group: { equals: fam.id } }, { 'member.relationTo': { equals: 'organizations' } }] })
     expect(made.totalDocs).toBe(1)
     expect((made.docs[0] as unknown as { status: string }).status).toBe('invited')
+  })
+
+  it('changes the level of an active organization the same whether or not a minor is behind it, and leaves the minor out', async () => {
+    const org2 = (await payload.create({ collection: 'organizations', data: { name: 'Other Co' } as never })) as unknown as U
+    const eve = await make('eve@example.com', { org: org2.id })
+    const orgkid = await make('orgkid@example.com', { minor: true, org: org.id })
+    const token = async (u: string) => (await payload.login({ collection: 'users', data: { email: u, password: PW } })).token as string
+    answers.canAccept = () => true
+    const mask = (x: string) => x.replace(/Made-up Co|Other Co/g, 'ORG').replace(/[0-9a-f]{24}/g, 'ID').replace(/"sessions":\[[^\]]*\]/g, 'S').replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, 'TIME')
+    const run = async (o: U, member: U) => {
+      await invite(ann, { member: ref(o, 'organizations'), level: 'viewer' })
+      const r = await rowOf(o, 'organizations')
+      await change(member, r.id, { status: 'active' })
+      log.length = 0
+      const res = await handleEndpoints({
+        config: payload.config,
+        request: new Request(`http://localhost/api/share-members/${r.id}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', Authorization: `JWT ${await token('ann@example.com')}` },
+          body: JSON.stringify({ level: 'manager' }),
+        }),
+      })
+      const headers = [...res.headers.entries()].filter(([k]) => !['date', 'content-length', 'set-cookie'].includes(k)).sort()
+      return { status: res.status, body: mask(await res.text()), headers: mask(JSON.stringify(headers)), audit: [...log], rowId: r.id }
+    }
+    const withMinor = await run(org, cat)
+    const adultsOnly = await run(org2, eve)
+    expect(withMinor.status).toBe(200)
+    const { rowId: a, ...x } = withMinor
+    const { rowId: b, ...y } = adultsOnly
+    expect(x).toEqual(y)
+    expect(x.audit).toEqual(['before:change-level', 'after:change-level'])
+    expect((await rowOf(org, 'organizations')).level).toBe('manager')
+    const stored = (id: unknown) => payload.findByID({ collection: 'share-members' as never, id: id as never, depth: 0, overrideAccess: true }) as unknown as Promise<{ vetoedPeople?: string[] }>
+    expect((await stored(a)).vetoedPeople).toEqual([String(orgkid.id)])
+    expect((await stored(b)).vetoedPeople).toEqual([])
+    expect(await roleIn(reqFor(orgkid), group.id)).toBeNull()
+  })
+
+  it('adds someone who became vetoed since accept to the left-out list at a level change, and keeps the earlier ones', async () => {
+    const orgkid = await make('orgkid@example.com', { minor: true, org: org.id })
+    const zed = await make('zed@example.com', { org: org.id })
+    answers.canAccept = () => true
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    const r = await rowOf(org, 'organizations')
+    await change(cat, r.id, { status: 'active' })
+    expect(await roleIn(reqFor(zed), group.id)).toBe('viewer')
+    await payload.update({ collection: 'users', id: zed.id, data: { minor: true } as never, overrideAccess: true })
+    expect(await refused(change(ann, r.id, { level: 'manager' }))).toBeNull()
+    const row = (await payload.findByID({ collection: 'share-members' as never, id: r.id as never, depth: 0, overrideAccess: true })) as unknown as { vetoedPeople: string[] }
+    expect([...row.vetoedPeople].sort()).toEqual([String(orgkid.id), String(zed.id)].sort())
+    expect(await roleIn(reqFor(zed), group.id)).toBeNull()
+    expect(await roleIn(reqFor(cat), group.id)).toBe('manager')
+  })
+
+  it('still refuses a level change when the veto refuses the organization itself', async () => {
+    answers.canAccept = () => true
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    const r = await rowOf(org, 'organizations')
+    await change(cat, r.id, { status: 'active' })
+    answers.refuse = () => 'No.'
+    expect(await refused(change(ann, r.id, { level: 'manager' }))).toBeTruthy()
+    expect((await rowOf(org, 'organizations')).level).toBe('viewer')
+  })
+
+  it('never gives the left-out list to the audit hooks', async () => {
+    const orgkid = await make('orgkid@example.com', { minor: true, org: org.id })
+    answers.canAccept = () => true
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    const r = await rowOf(org, 'organizations')
+    await change(cat, r.id, { status: 'active' })
+    await change(ann, r.id, { level: 'manager' })
+    await change(ann, r.id, { status: 'removed' })
+    const fay = await make('fay@example.com', { staff: true, org: org.id })
+    const g2 = await newGroup(fay, { owner: ref(org, 'organizations'), name: 'Founded' })
+    expect(g2.id).toBeTruthy()
+    expect(captured.length).toBeGreaterThan(6)
+    const hits = captured.filter((e) => JSON.stringify(e, (k, v) => (k === 'req' ? undefined : v)).includes('vetoedPeople') || JSON.stringify([e.membership, e.previous]).includes(String(orgkid.id)))
+    expect(hits).toEqual([])
+  })
+
+  it('refuses a peopleOf that is not a function or exactly false', () => {
+    const base = { kinds: [], memberTypes: ['organizations'], refuseMember: () => null }
+    for (const bad of [null, 0, '', true, 'yes', {}]) expect(() => sharing({ ...base, peopleOf: bad as never })({ collections: [] } as never)).toThrow(/peopleOf/)
+    expect(() => sharing({ ...base, peopleOf: false })({ collections: [] } as never)).not.toThrow()
   })
 
   it('refuses organizations as members without peopleOf or an explicit false', () => {

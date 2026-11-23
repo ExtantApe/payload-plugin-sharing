@@ -66,6 +66,8 @@ export const sharing =
     if (options.enabled === false) return config
     if (typeof options.refuseMember !== 'function' && options.refuseMember !== false)
       throw new Error('payload-plugin-sharing: pass `refuseMember`, a function that vetoes a member, or `refuseMember: false` to say there is none')
+    if (options.peopleOf !== undefined && options.peopleOf !== false && typeof options.peopleOf !== 'function')
+      throw new Error('payload-plugin-sharing: `peopleOf` must be a function or exactly `false`')
     const extra = [...new Set(options.memberTypes ?? [])].filter((m) => m !== (options.users ?? config.admin?.user ?? 'users'))
     if (extra.length && options.refuseMember !== false && options.peopleOf === undefined)
       throw new Error('payload-plugin-sharing: with organizations as members, pass `peopleOf` so the veto runs for each person behind them, or `peopleOf: false` to say it does not')
