@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The two `find` calls that pass the request (the last-Owner check and the duplicate-invite check) no longer paginate, so no count query rides beside them on a transaction's session, which could intermittently fail with NoSuchTransaction. Tested: 101 tests, including one that records every `find` made with a request and requires `pagination: false`; the full suite passed 5 runs in a row. Not tested: a live site.
 - The repo, with the standard Payload plugin kit. Public since 2026-11-22.
 - The first version of the plugin (for Captive Origins' business accounts):
   - `share-groups` and `share-members` collections, with Owner, Manager and Viewer levels the host can rename, and member types the host can extend to organizations.
