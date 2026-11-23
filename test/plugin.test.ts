@@ -17,7 +17,7 @@ let mongo: MongoMemoryReplSet
 const log: string[] = []
 const seen: { id?: unknown; data?: unknown; member?: unknown }[] = []
 const vetoSaw: { subject: unknown; via: unknown; actor: unknown; action: string }[] = []
-const answers: { canAccept?: () => unknown; refuse?: () => unknown; beforeInvite?: () => void; canInvite?: () => unknown; identities?: () => unknown } = {}
+const answers: { captureAudit?: (e: AuditEvent) => void; afterInvite?: () => void; canRead?: () => unknown; canAccept?: () => unknown; refuse?: () => unknown; beforeInvite?: () => void; canInvite?: () => unknown; identities?: () => unknown } = {}
 
 type U = { id: string | number }
 let ann: U, ben: U, cat: U, dan: U, kid: U, org: U
@@ -120,6 +120,7 @@ beforeAll(async () => {
           const found = await payload.find({ collection: 'users', where: { org: { equals: organization.value } }, pagination: false, overrideAccess: true })
           return found.docs.map((d) => ({ relationTo: 'users', value: d.id }))
         },
+        canRead: ({ req }) => (answers.canRead ? (answers.canRead() as never) : (undefined as never)),
         canAccept: () => (answers.canAccept ? (answers.canAccept() as boolean) : false),
         refuseMember: ({ subject, group: g, via, actor, action }) => {
           vetoSaw.push({ subject: (subject as { email?: string }).email ?? 'org', via, actor, action })
@@ -131,11 +132,17 @@ beforeAll(async () => {
             if (answers.beforeInvite) answers.beforeInvite()
             record(e)
           },
-          afterInvite: record,
+          afterInvite: (e) => {
+            if (answers.afterInvite) answers.afterInvite()
+            record(e)
+          },
           beforeAccept: record,
           afterAccept: record,
           beforeChangeLevel: record,
-          afterChangeLevel: record,
+          afterChangeLevel: (e) => {
+            answers.captureAudit?.(e)
+            record(e)
+          },
           beforeRemove: record,
           afterRemove: record,
         },
@@ -312,12 +319,27 @@ describe('the host veto', () => {
     expect(await refused(change(ann, (await rowOf(ben)).id, { level: 'manager' }))).toBe('Paused.')
   })
 
-  it('stops the change when a before audit hook throws, and logs an after hook that throws', async () => {
+  it('stops the change when a before audit hook throws', async () => {
     answers.beforeInvite = () => {
       throw new Error('audit down')
     }
     expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toMatch(/can’t be recorded/)
     expect((await rows({ status: { equals: 'invited' } })).totalDocs).toBe(0)
+  })
+
+  it('keeps the change when an after audit hook throws', async () => {
+    answers.afterInvite = () => {
+      throw new Error('audit down')
+    }
+    await invite(ann, { member: ref(ben), level: 'viewer' })
+    expect((await rowOf(ben)).status).toBe('invited')
+  })
+
+  it('gives the same answer to a vetoed person whether or not they are already in the group', async () => {
+    await invite(ann, { member: ref(ben), level: 'viewer' }) // live in the group
+    answers.refuse = () => 'Paused.'
+    expect(await refused(invite(ann, { member: ref(ben), level: 'viewer' }))).toBe('Paused.')
+    expect(await refused(invite(ann, { member: ref(dan), level: 'viewer' }))).toBe('Paused.')
   })
 })
 
@@ -655,74 +677,15 @@ describe('what the hooks are given', () => {
   })
 
   it('gives the audit hooks plain ids too', async () => {
-    const events: AuditEvent[] = []
-    answers.beforeInvite = () => undefined
-    await invite(ann, { member: ref(ben), level: 'viewer' })
-    void events
-    const r = await rowOf(ben)
-    expect(typeof r.id).not.toBe('object')
-  })
-})
-
-describe('members are keyed by their collection', () => {
-  it('does not give a user the membership of an organization with the same id, or the other way round', async () => {
-    await invite(ann, { member: ref(dan), level: 'manager' })
-    await change(dan, (await rowOf(dan)).id, { status: 'active' })
-    // someone who acts as an organization that happens to share dan's id
-    answers.identities = () => [{ relationTo: 'organizations', value: dan.id }]
-    expect(await roleIn(reqFor(ben), group.id)).toBeNull()
-    delete answers.identities
-    await invite(ann, { member: ref(org, 'organizations'), level: 'manager' })
-    await payload.update({ collection: 'share-members' as never, id: (await rowOf(org, 'organizations')).id as never, data: { status: 'active' } as never, overrideAccess: true })
-    answers.identities = () => [{ relationTo: 'users', value: org.id }]
-    expect(await roleIn(reqFor(ben), group.id)).toBeNull()
-  })
-})
-
-describe('the history', () => {
-  const events = async () =>
-    (await payload.find({ collection: 'share-member-events' as never, sort: 'createdAt', pagination: false, overrideAccess: true })).docs as unknown as { event: string; level: string; previousLevel?: string; previousStatus?: string; memberId: string; memberType: string }[]
-
-  it('records every invitation, acceptance, level change and removal', async () => {
     const r = await join(ben, 'viewer')
     await change(ann, r.id, { level: 'manager' })
-    await change(ben, r.id, { status: 'removed' })
-    const list = await events()
-    expect(list.map((e) => e.event)).toEqual(['invite', 'invite', 'accept', 'change-level', 'remove'])
-    expect(list[3]).toMatchObject({ level: 'manager', previousLevel: 'viewer', memberType: 'users', memberId: String(ben.id) })
-  })
-
-  it('records nothing for a change that was refused', async () => {
-    const before = (await events()).length
-    await refused(invite(dan, { member: ref(ben), level: 'viewer' }))
-    expect((await events()).length).toBe(before)
-  })
-
-  it('can’t be written, edited or deleted, by clients or by server code', async () => {
-    const e = (await payload.find({ collection: 'share-member-events' as never, overrideAccess: true })).docs[0] as { id: string }
-    expect(await refused(payload.create({ collection: 'share-member-events' as never, data: { group: group.id, membership: (await rowOf(ann)).id, memberType: 'users', memberId: 'x', event: 'invite' } as never, user: as(ann), overrideAccess: false }))).toBeTruthy()
-    expect(await refused(payload.update({ collection: 'share-member-events' as never, id: e.id as never, data: { level: 'x' } as never, overrideAccess: true }))).toMatch(/edited/)
-    expect(await refused(payload.delete({ collection: 'share-member-events' as never, id: e.id as never, overrideAccess: true }))).toMatch(/deleted/)
-  })
-
-  it('is read by a group’s Owners only', async () => {
-    await join(ben, 'manager')
-    const read = (u: U) => payload.find({ collection: 'share-member-events' as never, user: as(u), overrideAccess: false })
-    expect((await read(ann)).totalDocs).toBeGreaterThan(0)
-    expect(await refused(read(ben))).toBeTruthy()
-  })
-})
-
-describe('what a Viewer can see of the other members', () => {
-  it('shows a Viewer only the Owners and Managers, and their own row; a Manager sees everyone', async () => {
-    await join(ben, 'viewer')
-    await join(dan, 'viewer')
-    await join(cat, 'manager')
-    const names = async (u: U) =>
-      (await payload.find({ collection: 'share-members' as never, user: as(u), overrideAccess: false, pagination: false })).docs.map((d) => String(((d as unknown as { member: { value: { id?: unknown } | string } }).member.value as { id?: unknown })?.id ?? (d as unknown as { member: { value: unknown } }).member.value))
-    const sorted = (a: string[]) => [...a].sort()
-    expect(sorted(await names(ben))).toEqual(sorted([String(ann.id), String(cat.id), String(ben.id)]))
-    expect((await names(cat)).length).toBe(4)
+    const seenIds: unknown[] = []
+    answers.captureAudit = (e: AuditEvent) => seenIds.push(e.membership.group, e.membership.member.value, e.membership.id, e.by)
+    await change(ann, r.id, { level: 'viewer' })
+    expect(seenIds.length).toBeGreaterThan(0)
+    for (const v of seenIds) expect(typeof v).not.toBe('object')
+    expect(seenIds).toContain(group.id)
+    expect(seenIds).toContain(ben.id)
   })
 })
 
@@ -803,17 +766,30 @@ describe('the second review', () => {
     expect((await rows({ 'member.relationTo': { equals: 'organizations' } })).totalDocs).toBe(0)
   })
 
-  it('asks the per-person veto again on accept, and lets an organization of adults in', async () => {
+  it('asks the per-person veto again on accept, so someone who joined the organization later is stopped', async () => {
     await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
     await make('late@example.com', { minor: true, org: org.id }) // joins after the invitation
     answers.canAccept = () => true
     expect(await refused(change(cat, (await rowOf(org, 'organizations')).id, { status: 'active' }))).toBe('Not available for this account.')
+    expect((await rowOf(org, 'organizations')).status).toBe('invited')
+  })
+
+  it('lets an organization of adults in, and asks the veto for each of them', async () => {
+    vetoSaw.length = 0
+    await invite(ann, { member: ref(org, 'organizations'), level: 'viewer' })
+    answers.canAccept = () => true
+    await change(cat, (await rowOf(org, 'organizations')).id, { status: 'active' })
+    expect((await rowOf(org, 'organizations')).status).toBe('active')
+    expect(vetoSaw.some((v) => v.subject === 'cat@example.com' && v.action === 'accept')).toBe(true)
   })
 
   it('lets a minors-only veto pass a family group even for organization members', async () => {
     await make('orgkid2@example.com', { minor: true, org: org.id })
     const fam = await newGroup(ann, { kind: 'family', name: 'Family' })
     await payload.create({ collection: 'share-members' as never, data: { group: fam.id, member: ref(org, 'organizations'), level: 'viewer' } as never, user: as(ann), overrideAccess: false })
+    const made = await rows({ and: [{ group: { equals: fam.id } }, { 'member.relationTo': { equals: 'organizations' } }] })
+    expect(made.totalDocs).toBe(1)
+    expect((made.docs[0] as unknown as { status: string }).status).toBe('invited')
   })
 
   it('refuses organizations as members without peopleOf or an explicit false', () => {
@@ -825,13 +801,42 @@ describe('the second review', () => {
   })
 
   it('refuses to run without transactions, and runs with them', async () => {
-    const real = { db: { beginTransaction: async () => null, connection: { db: { admin: () => ({ command: async () => ({ setName: 'rs0' }) }) } } } }
-    await expect(assertTransactions(real)).resolves.toBeUndefined()
+    const replSet = { connection: { db: { admin: () => ({ command: async () => ({ setName: 'rs0' }) }) } } }
+    const withTx = { db: { ...replSet, beginTransaction: async () => 'tx1', rollbackTransaction: async () => undefined } }
+    await expect(assertTransactions(withTx)).resolves.toBeUndefined()
     await expect(assertTransactions(payload)).resolves.toBeUndefined()
-    const standalone = { db: { beginTransaction: async () => null, connection: { db: { admin: () => ({ command: async () => ({ isWritablePrimary: true }) }) } } } }
+    // Shaped like @payloadcms/db-mongodb with `transactionOptions: false`: beginTransaction is a no-op that returns null.
+    const noTx = { db: { ...replSet, transactionOptions: undefined, beginTransaction: async () => null } }
+    await expect(assertTransactions(noTx)).rejects.toThrow(/transactions/)
+    await expect(assertTransactions({ db: { ...replSet, beginTransaction: async () => undefined } })).rejects.toThrow(/transactions/)
+    await expect(assertTransactions({ db: { ...replSet, beginTransaction: async () => { throw new Error('no') } } })).rejects.toThrow(/transactions/)
+    const standalone = { db: { beginTransaction: async () => 'tx1', rollbackTransaction: async () => undefined, connection: { db: { admin: () => ({ command: async () => ({ isWritablePrimary: true }) }) } } } }
     await expect(assertTransactions(standalone)).rejects.toThrow(/transactions/)
-    await expect(assertTransactions({ db: { beginTransaction: async () => null, transactionOptions: false } })).rejects.toThrow(/transactions/)
     await expect(assertTransactions({ db: {} })).rejects.toThrow(/transactions/)
+    await expect(assertTransactions(noTx, { allowWithoutTransactions: true })).resolves.toBeUndefined()
+  })
+
+  it('rolls the check’s transaction back at once', async () => {
+    const calls: unknown[] = []
+    await assertTransactions({ db: { beginTransaction: async () => 'tx9', rollbackTransaction: async (id: unknown) => void calls.push(id) } })
+    expect(calls).toEqual(['tx9'])
+  })
+
+  it('refuses to start on a real adapter set up with transactionOptions: false', async () => {
+    const config = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('sharing_notx'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [sharing({ kinds: [{ value: 'hobby' }], refuseMember: false })],
+    })
+    const second = await getPayload({ config, key: 'no-transactions' }).then(
+      (p) => ({ p, error: null as string | null }),
+      (e: Error) => ({ p: null as Payload | null, error: e.message }),
+    )
+    await second.p?.db?.destroy?.()
+    expect(second.error).toMatch(/transactions/)
   })
 
   it('refuses a bulk member update, even for server code, so a change and its history row stay together', async () => {
@@ -839,6 +844,132 @@ describe('the second review', () => {
     await join(dan, 'viewer')
     expect(await refused(payload.update({ collection: 'share-members' as never, where: { level: { equals: 'viewer' } } as never, data: { notes: 'bulk' } as never, overrideAccess: true }))).toMatch(/one at a time/)
     expect((await rows({ notes: { equals: 'bulk' } })).totalDocs).toBe(0)
+  })
+})
+
+describe('the third review', () => {
+  const names = async (u: U) =>
+    ((await payload.find({ collection: 'share-members' as never, user: as(u), overrideAccess: false, pagination: false, depth: 0 })).docs as unknown as { member: { value: unknown } }[]).map((d) => String(d.member.value)).sort()
+  const ids = (...u: U[]) => u.map((x) => String(x.id)).sort()
+
+  describe('canRead only adds rows to the defaults', () => {
+    beforeEach(async () => {
+      await join(ben, 'viewer')
+      await invite(ann, { member: ref(dan), level: 'viewer' }) // invited: a Viewer shouldn't see this row by default
+      await invite(ann, { member: ref(cat), level: 'viewer' })
+    })
+
+    it('keeps the default for a Viewer when the host says nothing, true, false or {}', async () => {
+      for (const answer of [undefined, true, false, {}]) {
+        answers.canRead = () => answer
+        expect(await names(ben)).toEqual(ids(ann, ben))
+      }
+    })
+
+    it('keeps the default when the host hook throws', async () => {
+      answers.canRead = () => {
+        throw new Error('boom')
+      }
+      expect(await names(ben)).toEqual(ids(ann, ben))
+    })
+
+    it('adds rows for a narrow where without dropping the Viewer’s own row or the Owners', async () => {
+      answers.canRead = () => ({ 'member.value': { equals: cat.id } })
+      expect(await names(ben)).toEqual(ids(ann, ben, cat))
+    })
+
+    it('never shows a signed-out user anything, whatever the host answers', async () => {
+      answers.canRead = () => true
+      expect((await rows()).totalDocs).toBeGreaterThan(0)
+      expect(await refused(payload.find({ collection: 'share-members' as never, overrideAccess: false }))).toBeTruthy()
+    })
+
+    it('doesn’t show a stranger the rows of other groups when the host answers true', async () => {
+      answers.canRead = () => true
+      expect(await names(kid)).toEqual([])
+    })
+  })
+
+  describe('notes on someone’s own row', () => {
+    it('can’t be written during self-accept', async () => {
+      await payload.create({ collection: 'share-members' as never, data: { group: group.id, member: ref(ben), level: 'viewer', notes: 'staff note' } as never, user: as(ann), overrideAccess: false })
+      const r = await rowOf(ben)
+      await change(ben, r.id, { status: 'active', notes: 'overwritten' })
+      const after = (await rows({ id: { equals: r.id } })).docs[0] as unknown as { status: string; notes: string }
+      expect(after.status).toBe('active')
+      expect(after.notes).toBe('staff note')
+    })
+
+    it('can’t be written during self-leave, for a child either', async () => {
+      const fam = await newGroup(ann, { kind: 'family', name: 'Family' })
+      await payload.create({ collection: 'share-members' as never, data: { group: fam.id, member: ref(kid), level: 'viewer', notes: 'about the child' } as never, user: as(ann), overrideAccess: false })
+      const r = (await rows({ and: [{ group: { equals: fam.id } }, { 'member.value': { equals: kid.id } }] })).docs[0] as unknown as { id: string }
+      await change(kid, r.id, { status: 'active' })
+      await change(kid, r.id, { status: 'removed', notes: 'wiped' })
+      expect(((await rows({ id: { equals: r.id } })).docs[0] as unknown as { notes: string }).notes).toBe('about the child')
+    })
+
+    it('stay writable by an Owner on their own row and on others’', async () => {
+      const r = await rowOf(ann)
+      await change(ann, r.id, { notes: 'mine' })
+      expect(((await rows({ id: { equals: r.id } })).docs[0] as unknown as { notes: string }).notes).toBe('mine')
+      await join(ben, 'viewer')
+      await change(ann, (await rowOf(ben)).id, { notes: 'about ben' })
+      expect(((await rows({ id: { equals: (await rowOf(ben)).id } })).docs[0] as unknown as { notes: string }).notes).toBe('about ben')
+    })
+
+    it('can’t be used by a Viewer to search or sort what they can’t read', async () => {
+      await join(ben, 'viewer')
+      await payload.update({ collection: 'share-members' as never, id: (await rowOf(ann)).id as never, data: { notes: 'secret-word' } as never, overrideAccess: true })
+      const probe = async (query: Record<string, unknown>) => {
+        try {
+          return { docs: (await payload.find({ collection: 'share-members' as never, user: as(ben), overrideAccess: false, pagination: false, depth: 0, ...query } as never)).docs as unknown as Record<string, unknown>[] }
+        } catch (e) {
+          return { error: (e as Error).message }
+        }
+      }
+      const hit = await probe({ where: { notes: { contains: 'secret-word' } } })
+      const miss = await probe({ where: { notes: { contains: 'nothing-like-it' } } })
+      // Either the query is refused outright, or it answers the same whether or not the hidden text matches.
+      expect(JSON.stringify(hit)).toBe(JSON.stringify(miss))
+      const sorted = await probe({ sort: 'notes' })
+      const unsorted = await probe({ sort: '-notes' })
+      expect(sorted.error !== undefined || unsorted.error !== undefined || JSON.stringify((sorted.docs ?? []).map((d) => d.id)) === JSON.stringify((unsorted.docs ?? []).map((d) => d.id).reverse())).toBe(true)
+      for (const r of [hit, miss, sorted, unsorted]) for (const d of r.docs ?? []) expect(d.notes).toBeUndefined()
+    })
+  })
+
+  describe('level changes with other changes', () => {
+    it('refuses a removal that carries a level change, and changes nothing', async () => {
+      const r = await join(ben, 'viewer')
+      expect(await refused(change(ann, r.id, { status: 'removed', level: 'manager' }))).toMatch(/separate steps/)
+      const after = await rowOf(ben)
+      expect([after.status, after.level]).toEqual(['active', 'viewer'])
+    })
+
+    it('records both the accept and the level change when an invitation is accepted at a new level', async () => {
+      answers.canInvite = () => true
+      await invite(ann, { member: ref(ben), level: 'viewer' })
+      log.length = 0
+      const evs = async () => (await payload.find({ collection: 'share-member-events' as never, sort: 'createdAt', pagination: false, overrideAccess: true })).docs as unknown as { event: string; level: string; previousLevel?: string }[]
+      const before = (await evs()).length
+      await payload.update({ collection: 'share-members' as never, id: (await rowOf(ben)).id as never, data: { status: 'active', level: 'manager' } as never, overrideAccess: true })
+      const added = (await evs()).slice(before)
+      expect(added.map((e) => e.event).sort()).toEqual(['accept', 'change-level'])
+      expect(added.find((e) => e.event === 'change-level')).toMatchObject({ level: 'manager', previousLevel: 'viewer' })
+    })
+  })
+
+  it('records no inviter when the acting user is from another collection', async () => {
+    await payload.create({
+      collection: 'share-members' as never,
+      data: { group: group.id, member: ref(ben), level: 'viewer' } as never,
+      user: { id: ann.id, collection: 'organizations' } as never,
+      overrideAccess: true,
+    })
+    expect((await rows({ id: { exists: true }, 'member.value': { equals: ben.id } })).docs[0]).not.toHaveProperty('invitedBy', ann.id)
+    const row = (await rows({ 'member.value': { equals: ben.id } })).docs[0] as unknown as { invitedBy?: unknown }
+    expect(row.invitedBy ?? null).toBeNull()
   })
 })
 

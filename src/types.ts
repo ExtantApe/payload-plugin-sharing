@@ -136,7 +136,8 @@ export type SharingOptions = {
   canAccept?: Check<MemberArgs>
   /**
    * Who may read memberships. Default: your own, every row in groups where you are an Owner or Manager, and only the
-   * Owners and Managers of groups where you are a Viewer. May return a `where` to widen or narrow that.
+   * Owners and Managers of groups where you are a Viewer. Those rules always apply. A `where` you return is ORed with them
+   * and can only add rows. `true`, `false`, an empty `where` or a throw add nothing, so they can't open every row.
    */
   canRead?: (args: { req: PayloadRequest; user: User }) => boolean | Where | Promise<boolean | Where>
   /**
@@ -157,6 +158,11 @@ export type SharingOptions = {
     beforeRemove?: AuditHook
     afterRemove?: AuditHook
   }
+  /**
+   * Start even when the database can't run transactions. Not safe: two Owners leaving at once can both pass the
+   * last-Owner check, and a change can be saved without its history row. Default false.
+   */
+  allowWithoutTransactions?: boolean
   /** The admin group the collections sit in. Default `Sharing`. */
   adminGroup?: string
 }

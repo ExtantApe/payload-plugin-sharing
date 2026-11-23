@@ -1,6 +1,6 @@
 # First public push audit
 
-2026-11-22, before the repo went public (owner's words via Simon: "Prioritize that repo work for now then continue your other things"; D259 weekly grant).
+2026-11-22, before the repo went public (owner's words: "Prioritize that repo work for now then continue your other things").
 
 - **Leak check:** `scripts/leak-check.sh` passed on 18 files.
 - **Secrets:** no keys, passwords, tokens or private addresses in any commit's files or diffs. Pattern hits were only version numbers such as 10.0.1 in the lockfile.

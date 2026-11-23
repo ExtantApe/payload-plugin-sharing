@@ -18,13 +18,30 @@ export {
 } from './helpers.js'
 export * from './types.js'
 
-/** Throws unless the database can run transactions. The last-Owner rule and the history rows depend on them. */
-export async function assertTransactions(payload: unknown): Promise<void> {
+/**
+ * Throws unless the database can run transactions. The last-Owner rule and the history rows depend on them. It opens a
+ * transaction and rolls it straight back: an adapter set up without transactions (`transactionOptions: false` on the
+ * MongoDB adapter) swaps `beginTransaction` for a function that returns nothing, which is how this notices.
+ */
+export async function assertTransactions(payload: unknown, options: { allowWithoutTransactions?: boolean } = {}): Promise<void> {
+  if (options.allowWithoutTransactions === true) return
   const db = (payload as { db?: Record<string, any> }).db
   const fail = () => {
-    throw new Error('payload-plugin-sharing needs a database with transactions (for MongoDB, a replica set). Without them the last-Owner rule and the history can’t be kept safe, so it refuses to start.')
+    throw new Error('payload-plugin-sharing needs a database with transactions (for MongoDB, a replica set). Without them the last-Owner rule and the history can’t be kept safe, so it refuses to start. Pass `allowWithoutTransactions: true` only if you accept that.')
   }
-  if (!db || typeof db.beginTransaction !== 'function' || db.transactionOptions === false) return fail()
+  if (!db || typeof db.beginTransaction !== 'function') return fail()
+  let id: unknown
+  try {
+    id = await db.beginTransaction()
+  } catch {
+    return fail()
+  }
+  if (id === null || id === undefined || id === false) return fail()
+  try {
+    await db.rollbackTransaction?.(id)
+  } catch {
+    // The check already passed. A failed rollback of an empty transaction changes nothing.
+  }
   const raw = db.connection?.db
   if (raw) {
     const hello = await raw.admin().command({ hello: 1 }).catch(() => null)
@@ -73,7 +90,7 @@ export const sharing =
       custom: { ...config.custom, sharing: resolved },
       onInit: async (payload) => {
         await before?.(payload)
-        await assertTransactions(payload)
+        await assertTransactions(payload, { allowWithoutTransactions: options.allowWithoutTransactions })
       },
       collections: [...(config.collections ?? []), groupsCollection(resolved, options), membersCollection(resolved, options), eventsCollection(resolved, options)],
     }

@@ -43,7 +43,8 @@ const plain = (data: Record<string, unknown> | undefined): Partial<ShareMember> 
 
 export function membersCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {
   const levels = Object.values(s.levels)
-  const by = (req: PayloadRequest) => idOf(req.user)
+  // Only a user from the users collection counts as the actor; a user from another auth collection is recorded as no one.
+  const by = (req: PayloadRequest) => signedIn(req, s)?.id ?? null
 
   const loadGroup = async (req: PayloadRequest, id: unknown): Promise<GroupDoc | null> => {
     const gid = idOf(id)
@@ -200,21 +201,28 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
         const user = signedIn(req, s)
         if (!user) return false
         try {
-          if (opts.canRead) {
-            const answer = await opts.canRead({ req, user })
-            return answer === true ? true : answer && typeof answer === 'object' ? answer : false
-          }
           const refs = await identitiesOf(req, s)
           const staffed = await groupIdsFor(req, 'edit')
           const viewed = await groupIdsFor(req, 'view')
           // Owners and Managers see every row in their groups. A Viewer sees only the Owners and Managers, and their own row.
-          return {
+          const base = {
             or: [
               whereRefs(refs),
               ...(staffed.length ? [{ group: { in: staffed } }] : []),
               ...(viewed.length ? [{ and: [{ group: { in: viewed } }, { level: { in: [s.levels.owner.value, s.levels.manager.value] } }, { status: { equals: 'active' } }] }] : []),
             ],
           } as unknown as Where
+          if (!opts.canRead) return base
+          // The host can only add rows. Its `where` is ORed with the default rules, which always apply. `true`, `false`, an
+          // empty `where` and a throw add nothing, so no answer can hand out every row, a child's included.
+          let extra: unknown = null
+          try {
+            extra = await opts.canRead({ req, user })
+          } catch {
+            extra = null
+          }
+          if (extra && typeof extra === 'object' && !Array.isArray(extra) && Object.keys(extra).length) return { or: [base, extra as Where] } as unknown as Where
+          return base
         } catch {
           return false
         }
@@ -293,6 +301,8 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             data.removedAt = null
             data.removedBy = null
             if (asker !== null) data.invitedBy = asker
+            // The veto runs before the duplicate check, so a vetoed person gets the same answer whether or not they are already in.
+            await vetoed(req, group, ref, data.level, 'invite')
             const dup = await req.payload.find({
               collection: MEMBERS as never,
               where: { and: [{ group: { equals: group.id } }, { 'member.relationTo': { equals: ref.relationTo } }, { 'member.value': { equals: ref.value } }, { status: { in: LIVE } }] },
@@ -302,7 +312,6 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
               req,
             })
             if (dup.docs.length) throw refuse('That member is already in this group.')
-            await vetoed(req, group, ref, data.level, 'invite')
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([group.id, ref.relationTo, ref.value])
             await run(opts.audit?.beforeInvite, { event: 'invite', phase: 'before', membership: normalize(data), by: asker, req }, true)
@@ -319,6 +328,17 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             if (!same) throw refuse('Only the level, status and notes can be changed.')
           }
           for (const f of ['liveKey', 'acceptedAt', 'removedAt', 'removedBy']) delete data[f]
+          // Someone changing their own row (accepting or leaving) can't write the staff notes on it, unless they are staff in the group.
+          if ('notes' in data && isSelf(req, before.member)) {
+            let staff = false
+            try {
+              const r = await roleIn(req, before.group)
+              staff = r === 'owner' || r === 'manager'
+            } catch {
+              staff = false
+            }
+            if (!staff) delete data.notes
+          }
           const level: string = data.level ?? before.level
           const status = (data.status ?? before.status) as MemberStatus
           if (!roleOf(s, level)) throw refuse('Unknown level.')
@@ -327,6 +347,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
           const statusChanged = status !== before.status
           if (!levelChanged && !statusChanged) return data
           if (before.status === 'removed') throw refuse('A removed member is final. Invite them again.')
+          if (status === 'removed' && levelChanged) throw refuse('Change the level and remove in separate steps.')
           if (statusChanged && !(before.status === 'invited' && (status === 'active' || status === 'removed')) && !(before.status === 'active' && status === 'removed'))
             throw refuse('That status change isn’t allowed.')
           const group = await loadGroup(req, before.group)
@@ -392,7 +413,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
             else if (membership.status === 'active') await run(opts.audit?.afterAccept, { event: 'accept', phase: 'after', membership, previous, by: asker, req }, false)
           }
           if (previous.level !== membership.level && membership.status !== 'removed') {
-            if (previous.status === membership.status) await note('change-level', previous)
+            await note('change-level', previous)
             await run(opts.audit?.afterChangeLevel, { event: 'change-level', phase: 'after', membership, previous, by: asker, req }, false)
           }
           return doc
