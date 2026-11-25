@@ -28,6 +28,13 @@ const make = (email: string, extra: Record<string, unknown> = {}) =>
   payload.create({ collection: 'users', data: { email, password: PW, ...extra } as never }) as unknown as Promise<U>
 const ref = (u: U, relationTo = 'users') => ({ relationTo, value: u.id })
 const reqFor = (user: U | null) => ({ payload, user: user ? as(user) : null }) as never
+const marker = async (p: Promise<unknown>) => {
+  // The shape review tools such as whitehat accept as a refusal: a 403 whose data is exactly { refusal: 'transactions-required' }.
+  const e = (await p.then(() => null, (err: unknown) => err)) as { status?: unknown; data?: unknown } | null
+  expect(e?.status).toBe(403)
+  expect(e?.data).toEqual({ refusal: 'transactions-required' })
+  expect(Object.getPrototypeOf(e?.data)).toBe(Object.prototype)
+}
 const refused = async (p: Promise<unknown>) => {
   try {
     await p
@@ -1325,6 +1332,7 @@ describe('the third review', () => {
       const count = async () => (await payload.count({ collection: 'share-groups' as never, overrideAccess: true })).totalDocs
       const before = await count()
       expect(await refused(payload.create({ collection: 'share-groups' as never, data: { name: 'Loose', kind: 'hobby', owner: ref(kid) } as never, overrideAccess: true, disableTransaction: true }))).toMatch(/transaction/)
+      await marker(payload.create({ collection: 'share-groups' as never, data: { name: 'Loose', kind: 'hobby', owner: ref(kid) } as never, overrideAccess: true, disableTransaction: true }))
       expect(await count()).toBe(before)
     })
 
