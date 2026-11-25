@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-11-25)
 
 - A write refused for a missing transaction (the database stopped handing them out, or server code passed `disableTransaction`) now throws a 403 whose data is exactly `{ refusal: 'transactions-required' }`. The message is unchanged. Review tools such as whitehat count only that shape, or a bare 401, 403 or 404, as a refusal, so this guard showed as not checked before. Tested: the `disableTransaction` test now checks the shape (114 in all); it fails on the old code. Not tested: a live site.
 
