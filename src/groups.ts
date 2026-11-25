@@ -4,6 +4,8 @@ import { groupIdsFor, identitiesOf, idOf, refOf, sameRef, signedIn } from './hel
 import { GROUPS, MEMBERS, type ResolvedSharing, type ShareGroup, type SharingOptions } from './types.js'
 
 export const refuse = (message: string) => new APIError(message, 403, undefined, true)
+/** A missing transaction is refused with the shape review tools recognize: a 403 whose data is exactly `{ refusal: 'transactions-required' }`. */
+export const noTransaction = () => new APIError('This change needs a transaction, so it wasn’t made.', 403, { refusal: 'transactions-required' }, true)
 
 /** Only an exact `true` passes. A throw, a rejection or any other answer is a no. */
 export async function exactlyTrue(check: () => unknown): Promise<boolean> {
@@ -16,7 +18,7 @@ export async function exactlyTrue(check: () => unknown): Promise<boolean> {
 
 /** Server code can pass `disableTransaction`. The adapter can also hand back no transaction. Either way the change is refused, because it must be atomic with its lock and history rows. */
 export async function needTransaction(req: PayloadRequest, s: ResolvedSharing) {
-  if (s.needsTransactions && !(await req.transactionID)) throw refuse('This change needs a transaction, so it wasn’t made.')
+  if (s.needsTransactions && !(await req.transactionID)) throw noTransaction()
 }
 
 export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {

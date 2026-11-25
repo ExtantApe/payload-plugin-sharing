@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A write refused for a missing transaction (the database stopped handing them out, or server code passed `disableTransaction`) now throws a 403 whose data is exactly `{ refusal: 'transactions-required' }`. The message is unchanged. Review tools such as whitehat count only that shape, or a bare 401, 403 or 404, as a refusal, so this guard showed as not checked before. Tested: the `disableTransaction` test now checks the shape (114 in all); it fails on the old code. Not tested: a live site.
+
 ## 0.1.0 (2026-11-23)
 
 - Fourth review fixes. A level change on an active organization row now leaves a newly vetoed person out and succeeds, so an Owner gets the same answer whether or not a minor is behind it (before, it was a 403 only when someone was vetoed, and the level could never change). The host's veto of the organization itself is still the plain 403. `peopleOf` must be a function or exactly `false`; `null`, `0`, `''` and `true` stop the plugin from starting. The left-out list is stripped from audit payloads (before and after invite, accept, level change and remove) and from the `member` the host's access hooks are given. README: the left-out list is decided at join time and is not re-checked, with the late joiner, the minor who turns adult and the adult who becomes vetoed spelled out. Tested: 114 tests, including identical status, body, headers and audit at level change with and without a minor behind, the newly vetoed person added with the earlier ones kept, the organization's own refusal still a 403, each bad `peopleOf` value refused, and no left-out list or left-out id in any audit event. Not tested: a live site, and response timing.
