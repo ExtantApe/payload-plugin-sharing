@@ -1446,3 +1446,176 @@ describe('configuration', () => {
     expect(() => sharing({ kinds: [], refuseMember: false, levels: { viewer: { value: 'owner' } } })({ collections: [] } as never)).toThrow(/different values/)
   })
 })
+
+describe('duplicating is turned off', () => {
+  const SLUGS = ['share-groups', 'share-members', 'share-member-events']
+  const totals = async () => Promise.all(SLUGS.map(async (c) => (await payload.find({ collection: c as never, overrideAccess: true, pagination: false })).docs.length))
+  const first = async (collection: string) => (await payload.find({ collection: collection as never, overrideAccess: true, depth: 0 })).docs[0] as unknown as { id: string }
+  const idsFor = async (slug: string) => [String((await first(slug)).id), '0123456789abcdef01234567', 'not-an-id']
+  const rest = async (path: string, who: string) => {
+    const token = (await payload.login({ collection: 'users', data: { email: who, password: PW } })).token
+    const res = await handleEndpoints({
+      config: payload.config,
+      request: new Request(`http://localhost/api${path}`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `JWT ${token}` }, body: '{}' }),
+    })
+    return { status: res.status, body: (await res.text()).replaceAll(path, '<path>') }
+  }
+
+  /** Turns Payload’s own switch back on for a moment, so the plugin’s own refusal has to answer. */
+  const switchedOn = async (slug: string, run: () => Promise<void>) => {
+    const config = (payload.collections as unknown as Record<string, { config: { disableDuplicate?: boolean } }>)[slug]!.config
+    config.disableDuplicate = false
+    try {
+      await run()
+    } finally {
+      config.disableDuplicate = true
+    }
+  }
+
+  for (const slug of SLUGS) {
+    it(`sets the switch on ${slug}, and refuses Local duplicate for everyone`, async () => {
+      await join(ben, 'viewer')
+      expect((payload.collections as unknown as Record<string, { config: { disableDuplicate?: boolean } }>)[slug]!.config.disableDuplicate).toBe(true)
+      const before = await totals()
+      const id = (await first(slug)).id
+      for (const options of [{ overrideAccess: true }, { overrideAccess: true, user: as(ann) }, { overrideAccess: false, user: as(ann) }, { overrideAccess: false, user: as(ben) }, { overrideAccess: false }])
+        expect(await refused(payload.duplicate({ collection: slug as never, id: id as never, ...options }))).toMatch(/cannot be duplicated/)
+      expect(await totals()).toEqual(before)
+    })
+
+    it(`refuses a copying create in ${slug} before reading the source, with one answer for any id`, async () => {
+      await join(ben, 'viewer')
+      const before = await totals()
+      const sourceIds = await idsFor(slug)
+      await switchedOn(slug, async () => {
+        const answered = new Set<string>()
+        for (const id of [...sourceIds, '']) {
+          for (const options of [{ overrideAccess: true }, { overrideAccess: false, user: as(ann) }, { overrideAccess: false, user: as(ben) }, { overrideAccess: false }]) {
+            for (const attempt of [
+              () => payload.duplicate({ collection: slug as never, id: id as never, ...options }),
+              () => payload.create({ collection: slug as never, duplicateFromID: id as never, data: {} as never, ...options }),
+            ]) {
+              const e = (await attempt().then(() => null, (err: unknown) => err)) as { status?: number; message?: string } | null
+              answered.add(`${e?.status} ${e?.message}`)
+            }
+          }
+        }
+        expect([...answered]).toEqual(['403 Sharing records can’t be duplicated.'])
+      })
+      expect(await totals()).toEqual(before)
+    })
+
+    it(`has no way to duplicate ${slug} over REST`, async () => {
+      await join(ben, 'viewer')
+      const before = await totals()
+      for (const who of ['ann@example.com', 'ben@example.com']) {
+        const replies = []
+        for (const id of await idsFor(slug)) replies.push(await rest(`/${slug}/${id}/duplicate`, who))
+        for (const a of replies) expect(a.status).toBe(404)
+        expect(new Set(replies.map((a) => a.body)).size).toBe(1)
+      }
+      expect(await totals()).toEqual(before)
+    })
+  }
+
+  it('has no GraphQL duplicate mutation', () => {
+    const names = Object.keys(configToSchema(payload.config).schema.getMutationType()!.getFields())
+    expect(names).toContain('createShareGroup')
+    expect(names.filter((n) => /^duplicateShare/.test(n))).toEqual([])
+  })
+
+  it('still makes groups and invitations the ordinary way, over Local, REST and GraphQL', async () => {
+    const trimmed = (await newGroup(ann, { name: '  Spaced out  ' })) as unknown as { name: string; owner: { value: unknown } }
+    expect(trimmed.name).toBe('Spaced out')
+    await newGroup(ann, { owner: ref(ann) })
+    const token = (await payload.login({ collection: 'users', data: { email: 'ann@example.com', password: PW } })).token
+    const post = async (path: string, body: unknown) =>
+      (await handleEndpoints({ config: payload.config, request: new Request(`http://localhost/api${path}`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `JWT ${token}` }, body: JSON.stringify(body) }) })).status
+    expect(await post('/share-groups', { name: 'Over REST', kind: 'family' })).toBe(201)
+    expect(await post('/share-members', { group: group.id, member: ref(ben), level: 'viewer' })).toBe(201)
+    const req = await createLocalReq({ user: as(ann) }, payload)
+    req.payloadAPI = 'GraphQL'
+    const made = (await graphql({
+      schema: configToSchema(payload.config).schema,
+      source: `mutation { createShareGroup(data: { name: "Over GraphQL", kind: hobby, owner: { relationTo: users, value: "${ann.id}" } }) { id } }`,
+      contextValue: { req },
+    })) as { errors?: unknown[] }
+    expect(made.errors).toBeUndefined()
+    expect((await rowOf(ben)).status).toBe('invited')
+  })
+
+  it('accepts only plain field names on sharing records', async () => {
+    await join(ben, 'viewer')
+    const before = await totals()
+    const extraName = { name: 'Pond keepers', kind: 'hobby', owner: ref(ann), 'name.extra': 'x' }
+    const member = { group: group.id, member: ref(cat), level: 'viewer', 'level.extra': 'x' }
+    for (const options of [{ overrideAccess: false, user: as(ann) }, { overrideAccess: true }]) {
+      expect(await refused(payload.create({ collection: 'share-groups' as never, data: extraName as never, ...options }))).toMatch(/can’t contain a dot/)
+      expect(await refused(payload.create({ collection: 'share-members' as never, data: member as never, ...options }))).toMatch(/can’t contain a dot/)
+      expect(await refused(payload.create({ collection: 'share-groups' as never, data: { name: 'x', kind: 'hobby', owner: ref(ann), $example: {} } as never, ...options }))).toMatch(/dot or start with/)
+    }
+    const r = await rowOf(ben)
+    expect(await refused(change(ann, r.id, { level: 'manager', 'level.extra': 'x' }))).toMatch(/can’t contain a dot/)
+    expect(await refused(payload.update({ collection: 'share-groups' as never, id: group.id as never, data: { 'name.extra': 'x' } as never, user: as(ann), overrideAccess: false }))).toMatch(/can’t contain a dot/)
+    const token = (await payload.login({ collection: 'users', data: { email: 'ann@example.com', password: PW } })).token
+    const res = await handleEndpoints({
+      config: payload.config,
+      request: new Request('http://localhost/api/share-groups', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `JWT ${token}` }, body: JSON.stringify(extraName) }),
+    })
+    expect(res.status).toBe(403)
+    expect(await totals()).toEqual(before)
+    expect((await rows({ 'member.value': { equals: dan.id } })).docs).toHaveLength(0)
+    expect((await rowOf(ben)).level).toBe('viewer')
+  })
+
+  describe('a record in a group, when it is duplicated', () => {
+    let note: { id: string }
+    const groupOf = (doc: unknown) => (doc as { shareGroup?: unknown }).shareGroup ?? null
+    const copy = async (who: U | null, data?: Record<string, unknown>) => {
+      const made = (await payload.duplicate({ collection: 'notes' as never, id: note.id as never, data: data as never, user: who ? as(who) : undefined, overrideAccess: !who, depth: 0 })) as unknown as { id: string }
+      return groupOf(await payload.findByID({ collection: 'notes' as never, id: made.id as never, depth: 0, overrideAccess: true }))
+    }
+    beforeEach(async () => {
+      await join(ben, 'viewer')
+      await join(dan, 'manager')
+      note = (await payload.create({ collection: 'notes' as never, data: { title: 'Pond', shareGroup: group.id } as never, overrideAccess: true, depth: 0 })) as unknown as { id: string }
+    })
+
+    it('leaves the copy out of the group for a Viewer, whether or not they send the group', async () => {
+      expect(await copy(ben)).toBeNull()
+      expect(await copy(ben, { shareGroup: group.id })).toBeNull()
+      expect(await copy(ben, { shareGroup: null })).toBeNull()
+    })
+
+    it('leaves it out for a Viewer over REST and GraphQL too', async () => {
+      const token = (await payload.login({ collection: 'users', data: { email: 'ben@example.com', password: PW } })).token
+      for (const body of [{}, { shareGroup: group.id }]) {
+        const res = await handleEndpoints({
+          config: payload.config,
+          request: new Request(`http://localhost/api/notes/${note.id}/duplicate?depth=0`, { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `JWT ${token}` }, body: JSON.stringify(body) }),
+        })
+        expect(res.status).toBeLessThan(300)
+        expect(groupOf(((await res.json()) as { doc: unknown }).doc)).toBeNull()
+      }
+      const req = await createLocalReq({ user: as(ben) }, payload)
+      req.payloadAPI = 'GraphQL'
+      for (const data of [', data: {}', `, data: { shareGroup: "${group.id}" }`]) {
+        const made = (await graphql({ schema: configToSchema(payload.config).schema, source: `mutation { duplicateNote(id: "${note.id}"${data}) { id } }`, contextValue: { req } })) as { errors?: unknown[]; data?: { duplicateNote: { id: string } } }
+        expect(made.errors).toBeUndefined()
+        expect(groupOf(await payload.findByID({ collection: 'notes' as never, id: made.data!.duplicateNote.id as never, depth: 0, overrideAccess: true }))).toBeNull()
+      }
+      expect((await payload.find({ collection: 'notes' as never, where: { shareGroup: { equals: group.id } } as never, overrideAccess: true })).totalDocs).toBe(1)
+    })
+
+    it('keeps the group for a Manager, an Owner and server code', async () => {
+      for (const who of [dan, ann, null]) expect(await copy(who)).toBe(group.id)
+      expect(await copy(dan, { shareGroup: group.id })).toBe(group.id)
+    })
+
+    it('keeps the group on an update that sends it unchanged', async () => {
+      await payload.update({ collection: 'notes' as never, id: note.id as never, data: { title: 'Pond 2', shareGroup: group.id } as never, user: as(dan), overrideAccess: false })
+      const after = await payload.findByID({ collection: 'notes' as never, id: note.id as never, depth: 0, overrideAccess: true })
+      expect(groupOf(after)).toBe(group.id)
+    })
+  })
+})

@@ -1,6 +1,6 @@
 import { Forbidden, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
 
-import { exactlyTrue, needTransaction, refuse } from './groups.js'
+import { asRef, asText, checkIncoming, exactlyTrue, needTransaction, refuse, storedAsJudged } from './groups.js'
 import { idOf, identitiesOf, refOf, roleIn, roleOf, sameRef, signedIn, whereRefs, groupIdsFor } from './helpers.js'
 import {
   EVENTS,
@@ -173,6 +173,9 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
     }
   }
 
+  // A create that access rules apply to must also be saved as an invitation, never as an active member.
+  const stored = storedAsJudged(MEMBERS, (d) => [asText(idOf(d.group)), asRef(d.member), asText(d.level)], (row) => row.status === 'invited')
+
   return {
     slug: MEMBERS,
     labels: { singular: 'Share member', plural: 'Share members' },
@@ -182,6 +185,7 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       defaultColumns: ['group', 'member', 'level', 'status'],
       description: 'Who is in which group, and at what level. Leave by setting the status to Removed; rows are never deleted, so the record stays.',
     },
+    disableDuplicate: true,
     access: {
       create: ({ req, data }) => {
         const d = plain(data as Record<string, unknown>)
@@ -284,8 +288,11 @@ export function membersCollection(s: ResolvedSharing, opts: SharingOptions): Col
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
-      // A bulk update can run each row in its own transaction, which would split a change from its history row.
+      afterOperation: [stored.after],
       beforeOperation: [
+        checkIncoming,
+        stored.before,
+        // A bulk update can run each row in its own transaction, which would split a change from its history row.
         ({ args, operation }) => {
           if (operation === 'update' && (args as { id?: unknown }).id === undefined) throw refuse('Memberships are changed one at a time.')
           return args
@@ -494,6 +501,7 @@ export function eventsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
     slug: EVENTS,
     labels: { singular: 'Share member event', plural: 'Share member events' },
     admin: { group: opts.adminGroup ?? 'Sharing', defaultColumns: ['group', 'event', 'memberType', 'memberId', 'createdAt'], description: 'What changed in each group’s membership, and who changed it. Append-only.' },
+    disableDuplicate: true,
     access: {
       create: () => false,
       update: () => false,
@@ -520,6 +528,6 @@ export function eventsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       { name: 'previousStatus', type: 'text' },
       { name: 'by', type: 'relationship', relationTo: s.users },
     ],
-    hooks: { beforeDelete: [stop('deleted')], beforeChange: [({ operation, data }) => { if (operation !== 'create') throw refuse('The history can’t be edited.'); return data }] },
+    hooks: { beforeOperation: [checkIncoming], beforeDelete: [stop('deleted')], beforeChange: [({ operation, data }) => { if (operation !== 'create') throw refuse('The history can’t be edited.'); return data }] },
   }
 }

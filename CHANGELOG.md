@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 (2026-11-27)
+
+Upgrade note. What changes for a host:
+
+- Duplicating is off for `share-groups`, `share-members` and `share-member-events`, for everyone, server code included. The Duplicate button and the duplicate routes are gone, and a request to copy one of these records is refused. Server code that copied one needs to make a new one the ordinary way.
+- The three collections accept only plain field names, server code included. Send nested values as whole objects.
+- When access rules apply to a create, the saved record must match what they checked: a group's name (spaces trimmed), kind and first owner, or a membership's group, member and level, saved as an invitation. If your field default or hook changes one of these, the create is now rolled back.
+- `shareGroupField`: duplicating one of your records under access rules keeps its group only if the person has the Owner or Manager role it needs. Otherwise the copy is made without it (a `required` field fails validation). Server code that skips access still keeps it.
+- `shareGroupField`: the rule for changing a record's groups now works the same at the top level, in groups and in named tabs, with one group or several. Upgrade if you use the field.
+- `shareGroupField`: the plugin now refuses to start if the field is in an array or blocks, or if the field or anything around it is localized. Move it before upgrading.
+- `shareGroupField`: restoring a version that would make a group change the person isn't allowed to make is now refused as a whole.
+- Collections that use `shareGroupField`: every top-level name in a write has to be an ordinary field name, and the groups and tabs around the field have to be sent as objects. Check server code, imports and scripts that write these collections.
+
+Tested: 223 tests on Payload 3.92.1 with MongoDB in memory, over the Local API, REST and GraphQL, including a made-up second plugin that turns duplicating back on and changes records with hooks and defaults, and each supported place for `shareGroupField`. Not tested: a live site, the admin screens in a browser, database adapters other than MongoDB, a site with localization running, rich-text blocks, and the field on a global at runtime.
+
 ## 0.1.1 (2026-11-25)
 
 - A write refused for a missing transaction (the database stopped handing them out, or server code passed `disableTransaction`) now throws a 403 whose data is exactly `{ refusal: 'transactions-required' }`. The message is unchanged. Review tools such as whitehat count only that shape, or a bare 401, 403 or 404, as a refusal, so this guard showed as not checked before. Tested: the `disableTransaction` test now checks the shape (114 in all); it fails on the old code. Not tested: a live site.

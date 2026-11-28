@@ -2,6 +2,19 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-27: the share group field at any depth
+
+- Promises: changing a record's groups needs Owner or Manager in every group before and after, wherever the field is supported; unsupported places stop the plugin from starting; a restore that would make a change that isn't allowed is refused; writes the field can't check are refused.
+- Covered: `test/share-group-field.test.ts` (68 tests): the top level, groups, named tabs and a deeply nested group, with one group and several; single and bulk updates, partial updates, creates, duplicates, restores and draft restores; REST for the field-name rule; every refused place, the second check at start and the check at write time.
+- Gaps skipped (and why): the admin screens in a browser (only the answer to the permission question is tested); a running site with localization (the plugin refuses a localized field at start, which is tested); rich-text blocks and globals at runtime (not in the harness); database adapters other than MongoDB.
+- This closes the gap the entry below left for the field inside groups, tabs and arrays.
+
+## 2026-11-27: duplicating turned off
+
+- Promises: none of the three sharing collections can be duplicated, by anyone, over any route, even with Payload's duplicate setting turned back on; every source id gets the same answer; only plain field names are accepted; a create under access rules is saved as those rules checked it or rolled back; a duplicate of a host record keeps its share group only for an Owner or Manager there; ordinary creates still work.
+- Covered: `test/plugin.test.ts` (the setting, Local, REST and the GraphQL schema, plain field names, ordinary creates over all three routes, host duplicates over all three routes) and `test/saved-as-judged.test.ts` (a second plugin that turns the setting back on and changes records with hooks and defaults, rollback over Local and REST, the share group field inside a named group).
+- Gaps skipped (and why): the admin screens in a browser (the button follows the Payload setting, which is tested); database adapters other than MongoDB (not in the harness); updates to a share group field inside a named group, tab or array (documented as a limit in the README).
+
 ## 2026-11-23: level changes on organization rows, release 0.1.0
 
 - Promises: a level change on an active organization row leaves a newly vetoed person out and succeeds, with the same answer whether or not a minor is behind it; the organization's own veto is still a plain 403; `peopleOf` is a function or exactly `false`; no audit payload or access-hook argument carries the left-out list or a left-out person's id.

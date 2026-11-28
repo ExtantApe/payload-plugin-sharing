@@ -2,6 +2,7 @@ import type { Config, Plugin } from 'payload'
 
 import { groupsCollection } from './groups.js'
 import { eventsCollection, membersCollection } from './members.js'
+import { assertPlacements } from './share-group-field.js'
 import type { ResolvedSharing, Role, SharingOptions } from './types.js'
 
 export {
@@ -11,11 +12,11 @@ export {
   identitiesOf,
   membershipsOf,
   roleIn,
-  shareGroupField,
   sharedWhere,
   type HelperOptions,
   type Membership,
 } from './helpers.js'
+export { shareGroupField } from './share-group-field.js'
 export * from './types.js'
 
 /**
@@ -88,12 +89,15 @@ export const sharing =
       peopleOf: options.peopleOf,
       needsTransactions: options.allowWithoutTransactions !== true,
     }
+    assertPlacements(config)
     const before = config.onInit
     return {
       ...config,
       custom: { ...config.custom, sharing: resolved },
       onInit: async (payload) => {
         await before?.(payload)
+        // Again on the finished config, for fields that plugins after this one added or moved.
+        assertPlacements(payload.config as unknown as Config)
         await assertTransactions(payload, { allowWithoutTransactions: options.allowWithoutTransactions })
       },
       collections: [...(config.collections ?? []), groupsCollection(resolved, options), membersCollection(resolved, options), eventsCollection(resolved, options)],
