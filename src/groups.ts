@@ -1,4 +1,10 @@
-import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
+import {
+  APIError,
+  type CollectionAfterOperationHook,
+  type CollectionBeforeOperationHook,
+  type CollectionConfig,
+  type PayloadRequest,
+} from 'payload'
 
 import { groupIdsFor, identitiesOf, idOf, refOf, sameRef, signedIn } from './helpers.js'
 import { GROUPS, MEMBERS, type ResolvedSharing, type ShareGroup, type SharingOptions } from './types.js'
@@ -21,8 +27,60 @@ export async function needTransaction(req: PayloadRequest, s: ResolvedSharing) {
   if (s.needsTransactions && !(await req.transactionID)) throw noTransaction()
 }
 
+/**
+ * Runs first on every create and update of the plugin's collections, for everyone, server code included.
+ * - A create that copies another record is refused before that record is read, so every id gets the same answer.
+ * - Only plain field names are accepted: a name with a dot, or starting with `$`, is refused.
+ */
+export const checkIncoming: CollectionBeforeOperationHook = ({ args, operation }) => {
+  const a = args as { data?: unknown; duplicateFromID?: unknown }
+  if (operation === 'create' && a.duplicateFromID !== undefined && a.duplicateFromID !== null) throw refuse('Sharing records can’t be duplicated.')
+  if ((operation === 'create' || operation === 'update') && a.data && typeof a.data === 'object' && Object.keys(a.data).some((k) => k.includes('.') || k.startsWith('$')))
+    throw refuse('A field name can’t contain a dot or start with $.')
+  return args
+}
+
+const JUDGED = 'sharingJudged'
+type Row = Record<string, unknown>
+
+/** A value as one comparable string, or null when it is missing or the wrong shape. */
+export const asText = (v: unknown): string | null => (typeof v === 'string' || typeof v === 'number' ? String(v) : null)
+export const asRef = (v: unknown): string | null => {
+  const r = refOf(v)
+  return r ? JSON.stringify([r.relationTo, String(r.value)]) : null
+}
+
+/**
+ * For a create that access rules apply to: the row in the database must hold what those rules judged. `read` is run on
+ * what was sent, before any field default or hook, and again on the saved row. A difference rolls the create back.
+ */
+export function storedAsJudged(slug: string, read: (data: Row, req: PayloadRequest) => (string | null)[], alsoNeeds: (row: Row) => boolean = () => true) {
+  const before: CollectionBeforeOperationHook = ({ args, operation, req }) => {
+    const a = args as { data?: Row; overrideAccess?: boolean }
+    if (operation !== 'create' || a.overrideAccess) return args
+    return { ...args, [JUDGED]: read(a.data ?? {}, req) }
+  }
+  const after: CollectionAfterOperationHook = async ({ args, operation, result, req }) => {
+    const a = args as { overrideAccess?: boolean; [JUDGED]?: (string | null)[] }
+    if (operation !== 'create' || a.overrideAccess) return result
+    // Read straight from the database, so no read hook can change what is compared.
+    const row = (await req.payload.db.findOne({ collection: slug as never, where: { id: { equals: (result as { id: string | number }).id } }, req })) as Row | null
+    const judged = a[JUDGED]
+    const saved = row ? read(row, req) : null
+    if (!row || !alsoNeeds(row) || !judged || !saved || saved.length !== judged.length || !saved.every((v, i) => v !== null && v === judged[i]))
+      throw refuse('What would be saved isn’t what was checked, so it wasn’t made.')
+    return result
+  }
+  return { before, after }
+}
+
 export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): CollectionConfig {
   const memberTypes = s.memberTypes
+  // The name is trimmed, and a missing owner is the signed-in user, just as when the group is saved.
+  const stored = storedAsJudged(GROUPS, (d, req) => {
+    const user = signedIn(req, s)
+    return [asText(typeof d.name === 'string' ? d.name.trim() : d.name), asText(d.kind), asRef(refOf(d.owner) ?? (user ? { relationTo: s.users, value: user.id } : null))]
+  })
   return {
     slug: GROUPS,
     labels: { singular: 'Share group', plural: 'Share groups' },
@@ -32,6 +90,7 @@ export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       defaultColumns: ['name', 'kind', 'owner'],
       description: 'A group of people and organizations who share records. Groups are never deleted, and always keep an Owner.',
     },
+    disableDuplicate: true,
     access: {
       create: async ({ req, data }) => {
         const user = signedIn(req, s)
@@ -86,6 +145,8 @@ export function groupsCollection(s: ResolvedSharing, opts: SharingOptions): Coll
       { name: 'lock', type: 'number', hidden: true, admin: { disabled: true }, access: { create: () => false, update: () => false } },
     ],
     hooks: {
+      beforeOperation: [checkIncoming, stored.before],
+      afterOperation: [stored.after],
       // Groups are never deleted, not even by server code that skips access.
       beforeDelete: [
         () => {

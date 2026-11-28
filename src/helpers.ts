@@ -1,4 +1,4 @@
-import type { Field, PayloadRequest, Where } from 'payload'
+import type { PayloadRequest, Where } from 'payload'
 
 import { GROUPS, MEMBERS, type MemberRef, type ResolvedSharing, type Role, type ShareMember } from './types.js'
 
@@ -155,35 +155,4 @@ export async function sharedWhere(req: PayloadRequest, options: HelperOptions & 
   } catch {
     return false
   }
-}
-
-/**
- * The field a host collection adds to put its records in a group. Setting or changing it needs Owner or Manager in the
- * group the record goes into and in the one it leaves. A change that isn't allowed is dropped, not applied.
- */
-export function shareGroupField(options: { name?: string; hasMany?: boolean; label?: string } = {}): Field {
-  const name = options.name ?? 'shareGroup'
-  const allowed = async ({ req, siblingData, doc }: { req: PayloadRequest; siblingData?: unknown; doc?: unknown }) => {
-    try {
-      const next = groupsOf(siblingData, name)
-      const now = groupsOf(doc, name)
-      const touched = [...next, ...now]
-      if (!touched.length) return true
-      if (next.length === now.length && next.every((g) => now.some((n) => String(n) === String(g)))) return true
-      const mine = new Set((await groupIdsFor(req, 'edit')).map(String))
-      return touched.every((g) => mine.has(String(g)))
-    } catch {
-      return false
-    }
-  }
-  return {
-    name,
-    type: 'relationship',
-    relationTo: GROUPS,
-    hasMany: options.hasMany ?? false,
-    index: true,
-    label: options.label ?? 'Shared with',
-    access: { create: allowed as never, update: allowed as never },
-    admin: { description: 'The share group this record belongs to. Members of the group see it at their level.' },
-  } as Field
 }

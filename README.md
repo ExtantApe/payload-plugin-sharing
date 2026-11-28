@@ -2,7 +2,7 @@
 
 Sharing for Payload: people share records with other users and organizations, under access rules the host passes in.
 
-**Status:** first version, version 0.x, not on npm yet. It is tested against real Payload 3.92 with an in-memory MongoDB replica set (109 tests, including two requests at once and refusals over REST, GraphQL and bulk update). It has not been used in a live site yet, and the admin screens have not been checked in a browser. It needs a database that supports transactions (a MongoDB replica set), because the last-Owner rule and the history rely on them. On start it checks, and refuses to run without them.
+**Status:** version 0.x, on npm. It is tested against real Payload 3.92 with an in-memory MongoDB replica set (223 tests, including two requests at once, and refusals over REST, GraphQL, bulk update and duplicate). It has not been used in a live site yet, and the admin screens have not been checked in a browser. It needs a database that supports transactions (a MongoDB replica set), because the last-Owner rule and the history rely on them. On start it checks, and refuses to run without them.
 
 ## What it does
 
@@ -20,6 +20,9 @@ Rules the plugin enforces itself, for server code as well as for clients:
 - A removed member stays on record. Nothing is deleted, not even by server code that skips access (every delete throws), and a second live row for the same group and member can't exist.
 - Group kind and first owner can't change after the group is made.
 - Level, status and notes are the only fields that change on a membership.
+- Duplicating is off for `share-groups`, `share-members` and `share-member-events`, for everyone, server code included. Make a new record the ordinary way. A create that carries `duplicateFromID` is refused before anything is read, even if another plugin turns Payload's duplicate setting back on.
+- The three sharing collections accept only plain field names: a name with a dot, or one starting with `$`, is refused. Send nested values as objects, such as `owner: { relationTo, value }`.
+- When access rules apply to a create, the saved record must match what they checked: a group's name (spaces trimmed), kind and first owner (you, if none is sent), or a membership's group, member and level, saved as an invitation. If a field default or another hook changes one of these, the create is rolled back. Send those values yourself.
 
 Everything else is the host's call, and every host hook fails closed. With no hooks, nobody can make a group or invite anyone.
 
@@ -70,7 +73,7 @@ export default buildConfig({
 
 ### Helpers
 
-- `shareGroupField({ name?, hasMany? })`: the relation a host collection adds. Setting or moving it needs Owner or Manager in the group the record goes into and the one it leaves. A change that isn't allowed is dropped.
+- `shareGroupField({ name?, hasMany? })`: the relation a host collection adds. Setting or moving it needs Owner or Manager in the group the record goes into and the one it leaves. A change that isn't allowed is dropped. Restoring a version that would make a change that isn’t allowed is refused as a whole. When someone duplicates a record under access rules, they need to be an Owner or Manager in every group on the record they copy and in every group the copy would have, even if the data they send names other groups. Otherwise the copy is made without a group. Server code that skips access keeps it. If the field is `required`, such a duplicate fails validation.
 - `canView(req, doc)` and `canEdit(req, doc)`: for the host's access functions. Both return false on any error.
 - `sharedWhere(req, { need })`: a `where` for list access, or false.
 - `membershipsOf`, `roleIn`, `groupIdsFor`, `identitiesOf`: lower-level reads. These throw on a read error, so wrap them if you use them directly.
@@ -78,6 +81,10 @@ export default buildConfig({
 ## Limits
 
 - A record can be in one group (or several, with `hasMany`). Records don't inherit from parent groups.
+- Put `shareGroupField` at the top level of a collection, or inside a group or named tab (rows, collapsibles and unnamed tabs are fine too). The plugin refuses to start if the field is in an array or blocks, or if the field or anything around it is localized.
+- On a collection that uses `shareGroupField`, every top-level name in a write has to be an ordinary field name, and the groups and tabs around the field have to be sent as objects. Other writes are refused, server code included.
+- The `field` option of `canView` and `canEdit` reads a top-level key only. For a nested field, pass them the object that holds it.
+- With `allowWithoutTransactions` and no transaction, a create that is rolled back for not matching what was checked stays saved.
 - Hooks get plain ids and `{ relationTo, value }` references, plus the `id` and `data` of the change.
 - `notes`, `invitedBy` and `removedBy` on a membership are readable by the group's Owners and Managers only, and notes are capped at 500 characters.
 - Someone changing their own row (accepting or leaving) can't write its notes (on a new invitation either), and neither can someone acting for an organization on its row, unless they are an Owner or Manager of the group. Server code can.
